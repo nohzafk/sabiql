@@ -1,6 +1,6 @@
 ---
 source: src/tests/render_snapshots/overlays.rs
-assertion_line: 432
+assertion_line: 463
 expression: output
 ---
 test_project | test_db | - | no dsn | localhost:5432/test                                                                                                            
@@ -18,29 +18,29 @@ test_project | test_db | - | no dsn | localhost:5432/test
 │                                       ││                                                                                                                          │
 │                                ╭ Settings ───────────────────────────────────────────────────────────────────────────────────────╮                                │
 │                                │                  │                                                                              │                                │
-│                                │  > Appearance    │Theme                                                                         │                                │
-│                                │    ER Diagram    │                                                                              │                                │
-│                                │                  │  > Sabiql Dark    saved                                                      │                                │
-│                                │                  │    Light                                                                     │                                │
+│                                │    Appearance    │ER Diagram                                                                    │                                │
+│                                │  > ER Diagram    │                                                                              │                                │
+│                                │                  │Browser                                                                       │                                │
 │                                │                  │                                                                              │                                │
-│                                │                  │                                                                              │                                │
-│                                │                  │                                                                              │                                │
-│                                │                  │                                                                              │                                │
-│                                │                  │                                                                              │                                │
-│                                │                  │                                                                              │────────────────────────────────┘
+│                                │                  │    System default                                                            │                                │
+│                                │                  │    Google Chrome                                                             │                                │
+│                                │                  │    Firefox                                                                   │                                │
+│                                │                  │    Safari                                                                    │                                │
+│                                │                  │    Microsoft Edge                                                            │                                │
+│                                │                  │    Brave                                                                     │────────────────────────────────┘
 │                                │                  │                                                                              │────────────────────────────────┐
+│                                │                  │Custom command                                                                │                                │
+│                                │                  │  > [Brave Browser] saved                                                     │                                │
 │                                │                  │                                                                              │                                │
 │                                │                  │                                                                              │                                │
 │                                │                  │                                                                              │                                │
-│                                │                  │ Preview ─────────────────────────────────────────────────────────────────────│                                │
-│                                │                  │> Active item        Selected row                                             │                                │
-│                                │                  │  Secondary text     Muted text                                               │                                │
-│                                │                  │╭ Focused panel ─────────────╮                                                │                                │
-│                                │                  ││ Primary text  Accent text  │                                                │                                │
-│                                │                  │╰────────────────────────────╯                                                │                                │
-│                                │                  │Choose a theme that fits your terminal.                                       │                                │
 │                                │                  │                                                                              │                                │
-│                                ╰ Enter Apply │ Tab/⇧Tab Section │ Esc Cancel ────────────────────────────────────────────────────╯                                │
+│                                │                  │                                                                              │                                │
+│                                │                  │                                                                              │                                │
+│                                │                  │                                                                              │                                │
+│                                │                  │                                                                              │                                │
+│                                │                  │                                                                              │                                │
+│                                ╰ Enter Apply │ i Edit │ Tab/⇧Tab Section │ Esc Cancel ───────────────────────────────────────────╯                                │
 │                                       ││                                                                                                                          │
 │                                       ││                                                                                                                          │
 │                                       ││                                                                                                                          │
@@ -52,4 +52,4 @@ test_project | test_db | - | no dsn | localhost:5432/test
 │                                       ││                                                                                                                          │
 │                                       ││                                                                                                                          │
 └───────────────────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter:Apply  j/k/↑↓:Select  Tab/⇧Tab:Section  Esc:Cancel
+Enter:Apply  j/k/↑↓:Select  i:Edit  Tab/⇧Tab:Section  Esc:Cancel

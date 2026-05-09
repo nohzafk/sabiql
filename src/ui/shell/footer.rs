@@ -14,12 +14,13 @@ use crate::app::update::input::keybindings::{
     CELL_EDIT_KEYS, COMMAND_PALETTE_ROWS, CONNECTION_ERROR_ROWS, CONNECTION_SELECTOR_ROWS,
     CONNECTION_SETUP_KEYS, ER_PICKER_ROWS, FOOTER_NAV_KEYS, GLOBAL_KEYS, HELP_ROWS, HISTORY_KEYS,
     INSPECTOR_DDL_KEYS, JSONB_DETAIL_ROWS, JSONB_EDIT_ROWS, JSONB_SEARCH_KEYS, OVERLAY_KEYS,
-    QUERY_HISTORY_PICKER_ROWS, RESULT_ACTIVE_KEYS, SETTINGS_ROWS, SQL_MODAL_CONFIRMING_KEYS,
-    SQL_MODAL_KEYS, SQL_MODAL_PLAN_KEYS, TABLE_PICKER_ROWS, idx,
+    QUERY_HISTORY_PICKER_ROWS, RESULT_ACTIVE_KEYS, SQL_MODAL_CONFIRMING_KEYS, SQL_MODAL_KEYS,
+    SQL_MODAL_PLAN_KEYS, TABLE_PICKER_ROWS, idx,
 };
 use crate::primitives::atoms::key_text;
 use crate::primitives::atoms::spinner_char;
 use crate::primitives::atoms::status_message::{MessageType, StatusMessage};
+use crate::settings_hints::settings_hints;
 use crate::theme::ThemePalette;
 
 pub struct Footer;
@@ -231,13 +232,7 @@ impl Footer {
                 HELP_ROWS[idx::help::H_SCROLL].as_hint(),
                 HELP_ROWS[idx::help::CLOSE].as_hint(),
             ],
-            InputMode::Settings => {
-                vec![
-                    SETTINGS_ROWS[idx::settings::APPLY].as_hint(),
-                    SETTINGS_ROWS[idx::settings::SELECT].as_hint(),
-                    SETTINGS_ROWS[idx::settings::CANCEL].as_hint(),
-                ]
-            }
+            InputMode::Settings => settings_hints(state),
             InputMode::ConfirmDialog => vec![],
             InputMode::SqlModal => {
                 if matches!(
@@ -409,6 +404,38 @@ mod tests {
         assert_eq!(
             hints.contains(&GLOBAL_KEYS[idx::global::INSPECTOR_TABS].as_hint()),
             expected_visible
+        );
+    }
+
+    #[test]
+    fn settings_custom_browser_hint_shows_edit_when_selected() {
+        let mut state = AppState::new("test".to_string());
+        let services = AppServices::stub();
+        state.modal.set_mode(InputMode::Settings);
+        state.settings.switch_next_section();
+        state.settings.start_custom_browser_edit();
+        state.settings.stop_custom_browser_edit();
+
+        let hints = Footer::get_context_hints(&state, &services);
+
+        assert!(hints.contains(&("i", "Edit")));
+        assert!(hints.contains(&("Tab/⇧Tab", "Section")));
+        assert!(hints.contains(&("Esc", "Cancel")));
+    }
+
+    #[test]
+    fn settings_custom_browser_edit_hint_shows_done_and_typing() {
+        let mut state = AppState::new("test".to_string());
+        let services = AppServices::stub();
+        state.modal.set_mode(InputMode::Settings);
+        state.settings.switch_next_section();
+        state.settings.start_custom_browser_edit();
+
+        let hints = Footer::get_context_hints(&state, &services);
+
+        assert_eq!(
+            hints,
+            vec![("Enter", "Apply"), ("Esc", "Done"), ("Type", "Browser")]
         );
     }
 }

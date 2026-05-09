@@ -588,12 +588,38 @@ pub const SETTINGS_ROWS: &[ModeRow] = &[
         description: "Select setting",
         bindings: &[
             ExecBinding {
-                action: Action::SettingsSelectNextTheme,
-                combos: &[KeyCombo::plain(Key::Char('j')), KeyCombo::plain(Key::Down)],
+                action: Action::SettingsSelectNext,
+                combos: &[KeyCombo::plain(Key::Down), KeyCombo::plain(Key::Char('j'))],
             },
             ExecBinding {
-                action: Action::SettingsSelectPreviousTheme,
-                combos: &[KeyCombo::plain(Key::Char('k')), KeyCombo::plain(Key::Up)],
+                action: Action::SettingsSelectPrevious,
+                combos: &[KeyCombo::plain(Key::Up), KeyCombo::plain(Key::Char('k'))],
+            },
+        ],
+    },
+    ModeRow {
+        key_short: "i",
+        key: "i",
+        desc_short: "Edit",
+        description: "Edit custom browser",
+        bindings: &[ExecBinding {
+            action: Action::SettingsStartCustomBrowserEdit,
+            combos: &[KeyCombo::plain(Key::Char('i'))],
+        }],
+    },
+    ModeRow {
+        key_short: "Tab/⇧Tab",
+        key: "Tab / Shift+Tab",
+        desc_short: "Section",
+        description: "Switch settings section",
+        bindings: &[
+            ExecBinding {
+                action: Action::SettingsNextSection,
+                combos: &[KeyCombo::plain(Key::Tab)],
+            },
+            ExecBinding {
+                action: Action::SettingsPreviousSection,
+                combos: &[KeyCombo::shift(Key::BackTab)],
             },
         ],
     },

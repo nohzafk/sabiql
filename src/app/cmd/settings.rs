@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
 use crate::cmd::effect::Effect;
-use crate::ports::outbound::{AppSettings, SettingsStore};
+use crate::ports::outbound::SettingsStore;
 use crate::update::action::Action;
 
 pub(crate) async fn run(
@@ -9,13 +9,13 @@ pub(crate) async fn run(
     action_tx: &mpsc::Sender<Action>,
     settings_store: &std::sync::Arc<dyn SettingsStore>,
 ) {
-    let Effect::SaveSettings { theme_id } = effect else {
+    let Effect::SaveSettings { settings } = effect else {
         return;
     };
 
-    let result = settings_store.save(AppSettings { theme_id });
+    let result = settings_store.save(settings.clone());
     let action = match result {
-        Ok(()) => Action::SettingsSaved,
+        Ok(()) => Action::SettingsSaved(settings),
         Err(error) => Action::SettingsSaveFailed(error),
     };
     let _ = action_tx.send(action).await;
@@ -69,7 +69,10 @@ mod tests {
 
         run(
             Effect::SaveSettings {
-                theme_id: ThemeId::Light,
+                settings: AppSettings {
+                    theme_id: ThemeId::Light,
+                    er_browser: Some("Firefox".to_string()),
+                },
             },
             &tx,
             &(store.clone() as Arc<dyn SettingsStore>),
@@ -77,7 +80,16 @@ mod tests {
         .await;
 
         assert_eq!(store.saved.lock().unwrap()[0].theme_id, ThemeId::Light);
-        assert!(matches!(rx.recv().await, Some(Action::SettingsSaved)));
+        assert_eq!(
+            store.saved.lock().unwrap()[0].er_browser.as_deref(),
+            Some("Firefox")
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Action::SettingsSaved(settings))
+                if settings.theme_id == ThemeId::Light
+                    && settings.er_browser.as_deref() == Some("Firefox")
+        ));
     }
 
     #[tokio::test]
@@ -87,7 +99,10 @@ mod tests {
 
         run(
             Effect::SaveSettings {
-                theme_id: ThemeId::Light,
+                settings: AppSettings {
+                    theme_id: ThemeId::Light,
+                    er_browser: None,
+                },
             },
             &tx,
             &(store as Arc<dyn SettingsStore>),

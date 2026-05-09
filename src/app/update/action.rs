@@ -6,12 +6,12 @@ use crate::model::shared::focused_pane::FocusedPane;
 use crate::model::shared::key_sequence::Prefix;
 use crate::model::sql_editor::completion::CompletionCandidate;
 use crate::policy::write::write_guardrails::WritePreview;
-use crate::ports::outbound::DbOperationError;
 use crate::ports::outbound::clipboard::ClipboardError;
 use crate::ports::outbound::connection_store::ConnectionStoreError;
 use crate::ports::outbound::folder_opener::FolderOpenError;
 use crate::ports::outbound::query_history::QueryHistoryError;
 use crate::ports::outbound::settings_store::SettingsStoreError;
+use crate::ports::outbound::{AppSettings, DbOperationError};
 use std::collections::HashMap;
 
 use crate::domain::{ConnectionId, DatabaseMetadata, QueryResult, QuerySource, Table};
@@ -148,6 +148,7 @@ pub enum InputTarget {
     CommandLine,
     Filter,
     ErFilter,
+    SettingsErBrowser,
     QueryHistoryFilter,
     JsonbEdit,
     JsonbSearch,
@@ -343,11 +344,15 @@ pub enum Action {
     CommandLineSubmit,
 
     // Settings
-    SettingsSelectNextTheme,
-    SettingsSelectPreviousTheme,
+    SettingsSelectNext,
+    SettingsSelectPrevious,
+    SettingsNextSection,
+    SettingsPreviousSection,
+    SettingsStartCustomBrowserEdit,
+    SettingsStopCustomBrowserEdit,
     SettingsApply,
     SettingsCancel,
-    SettingsSaved,
+    SettingsSaved(AppSettings),
     SettingsSaveFailed(SettingsStoreError),
 
     // Connection list navigation

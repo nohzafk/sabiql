@@ -5,6 +5,7 @@ use crate::model::app_state::AppState;
 use crate::model::shared::confirm_dialog::ConfirmIntent;
 use crate::model::shared::flash_timer::FlashId;
 use crate::model::shared::input_mode::InputMode;
+use crate::ports::outbound::AppSettings;
 use crate::update::action::{
     Action, InputTarget, ListMotion, ListTarget, ModalKind, ScrollAmount, ScrollDirection,
     ScrollTarget,
@@ -58,27 +59,77 @@ pub fn reduce_modal(state: &mut AppState, action: &Action, now: Instant) -> Opti
             state.modal.set_mode(InputMode::Settings);
             Some(vec![])
         }
-        Action::SettingsSelectNextTheme => {
-            state.settings.select_next_theme();
+        Action::SettingsSelectNext => {
+            state.settings.select_next();
             Some(vec![])
         }
-        Action::SettingsSelectPreviousTheme => {
-            state.settings.select_previous_theme();
+        Action::SettingsSelectPrevious => {
+            state.settings.select_previous();
+            Some(vec![])
+        }
+        Action::SettingsNextSection => {
+            state.settings.switch_next_section();
+            Some(vec![])
+        }
+        Action::SettingsPreviousSection => {
+            state.settings.switch_previous_section();
+            Some(vec![])
+        }
+        Action::SettingsStartCustomBrowserEdit => {
+            state.settings.start_custom_browser_edit();
+            Some(vec![])
+        }
+        Action::SettingsStopCustomBrowserEdit => {
+            state.settings.stop_custom_browser_edit();
+            Some(vec![])
+        }
+        Action::TextInput {
+            target: InputTarget::SettingsErBrowser,
+            ch,
+        } => {
+            state.settings.input_custom_browser(*ch);
+            Some(vec![])
+        }
+        Action::TextBackspace {
+            target: InputTarget::SettingsErBrowser,
+        } => {
+            state.settings.backspace_custom_browser();
+            Some(vec![])
+        }
+        Action::TextDelete {
+            target: InputTarget::SettingsErBrowser,
+        } => {
+            state.settings.delete_custom_browser();
+            Some(vec![])
+        }
+        Action::TextMoveCursor {
+            target: InputTarget::SettingsErBrowser,
+            direction,
+        } => {
+            state.settings.move_custom_browser_cursor(*direction);
             Some(vec![])
         }
         Action::SettingsApply => {
             let theme_id = state.settings.selected_theme();
-            state.ui.set_theme(theme_id);
-            state.modal.set_mode(InputMode::Normal);
-            state.set_success(format!("Theme set to {}", theme_id.label()));
-            Some(vec![Effect::SaveSettings { theme_id }])
+            let settings = AppSettings {
+                theme_id,
+                er_browser: state.settings.selected_er_browser(),
+            };
+            Some(vec![Effect::SaveSettings { settings }])
         }
         Action::SettingsCancel | Action::CloseModal(ModalKind::Settings) => {
             state.settings.discard_selection();
             state.modal.set_mode(InputMode::Normal);
             Some(vec![])
         }
-        Action::SettingsSaved => Some(vec![]),
+        Action::SettingsSaved(settings) => {
+            state.ui.set_theme(settings.theme_id);
+            state
+                .settings
+                .commit_saved(settings.theme_id, settings.er_browser.clone());
+            state.set_success("Settings saved".to_string());
+            Some(vec![])
+        }
         Action::SettingsSaveFailed(error) => {
             state.set_error(format!("Failed to save settings: {error}"));
             Some(vec![])
@@ -455,7 +506,7 @@ mod tests {
                     Instant::now(),
                 );
 
-                reduce_modal(&mut state, &Action::SettingsSelectNextTheme, Instant::now());
+                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
                 assert_eq!(state.settings.selected_theme(), ThemeId::Light);
                 assert_eq!(state.ui.theme_id(), ThemeId::Default);
@@ -471,7 +522,7 @@ mod tests {
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsSelectNextTheme, Instant::now());
+                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
                 let effects = reduce_modal(&mut state, &action, Instant::now()).unwrap();
 
@@ -482,26 +533,117 @@ mod tests {
             }
 
             #[test]
-            fn apply_commits_selection() {
+            fn apply_emits_settings_save_effect() {
                 let mut state = create_test_state();
                 reduce_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsSelectNextTheme, Instant::now());
+                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
                 let effects =
                     reduce_modal(&mut state, &Action::SettingsApply, Instant::now()).unwrap();
 
-                assert_eq!(state.input_mode(), InputMode::Normal);
-                assert_eq!(state.ui.theme_id(), ThemeId::Light);
+                assert_eq!(state.input_mode(), InputMode::Settings);
+                assert_eq!(state.ui.theme_id(), ThemeId::Default);
                 assert!(matches!(
                     effects.as_slice(),
-                    [Effect::SaveSettings {
-                        theme_id: ThemeId::Light
-                    }]
+                    [Effect::SaveSettings { settings }]
+                        if settings.theme_id == ThemeId::Light && settings.er_browser.is_none()
                 ));
+            }
+
+            #[test]
+            fn apply_emits_er_browser_save_effect() {
+                let mut state = create_test_state();
+                reduce_modal(
+                    &mut state,
+                    &Action::OpenModal(ModalKind::Settings),
+                    Instant::now(),
+                );
+                reduce_modal(&mut state, &Action::SettingsNextSection, Instant::now());
+                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+
+                let effects =
+                    reduce_modal(&mut state, &Action::SettingsApply, Instant::now()).unwrap();
+
+                assert_eq!(state.input_mode(), InputMode::Settings);
+                assert_eq!(state.settings.saved_er_browser(), None);
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::SaveSettings { settings }]
+                        if settings.er_browser.as_deref() == Some("Google Chrome")
+                ));
+            }
+
+            #[test]
+            fn custom_browser_input_is_saved() {
+                let mut state = create_test_state();
+                reduce_modal(
+                    &mut state,
+                    &Action::OpenModal(ModalKind::Settings),
+                    Instant::now(),
+                );
+                reduce_modal(&mut state, &Action::SettingsNextSection, Instant::now());
+                reduce_modal(
+                    &mut state,
+                    &Action::SettingsStartCustomBrowserEdit,
+                    Instant::now(),
+                );
+                reduce_modal(
+                    &mut state,
+                    &Action::TextInput {
+                        target: InputTarget::SettingsErBrowser,
+                        ch: 'B',
+                    },
+                    Instant::now(),
+                );
+
+                let effects =
+                    reduce_modal(&mut state, &Action::SettingsApply, Instant::now()).unwrap();
+
+                assert_eq!(state.input_mode(), InputMode::Settings);
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::SaveSettings { settings }]
+                        if settings.er_browser.as_deref() == Some("B")
+                ));
+            }
+
+            #[test]
+            fn save_success_commits_pending_settings() {
+                let mut state = create_test_state();
+                reduce_modal(
+                    &mut state,
+                    &Action::OpenModal(ModalKind::Settings),
+                    Instant::now(),
+                );
+                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                reduce_modal(&mut state, &Action::SettingsNextSection, Instant::now());
+                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+
+                let effects = reduce_modal(
+                    &mut state,
+                    &Action::SettingsSaved(AppSettings {
+                        theme_id: ThemeId::Light,
+                        er_browser: Some("Google Chrome".to_string()),
+                    }),
+                    Instant::now(),
+                )
+                .unwrap();
+
+                assert_eq!(state.ui.theme_id(), ThemeId::Light);
+                assert_eq!(state.settings.previous_theme(), ThemeId::Light);
+                assert_eq!(state.settings.saved_er_browser(), Some("Google Chrome"));
+                assert!(
+                    state
+                        .messages
+                        .last_success
+                        .as_deref()
+                        .is_some_and(|message| { message.contains("Settings saved") })
+                );
+                assert!(effects.is_empty());
             }
         }
 
