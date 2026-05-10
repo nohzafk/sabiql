@@ -146,11 +146,6 @@ impl SettingsOverlay {
             )));
         }
 
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Other",
-            Style::default().fg(theme.semantic.text.primary),
-        )));
         let custom_selected =
             state.settings.selected_er_browser_choice() == ErBrowserChoice::Custom;
         let custom_saved = saved_browser_matches(state, ErBrowserChoice::Custom);
@@ -161,7 +156,8 @@ impl SettingsOverlay {
         } else {
             Style::default().fg(theme.semantic.text.secondary)
         };
-        let mut spans = vec![Span::styled(format!("  {marker} ["), style)];
+        let prefix = format!("  {marker} Other: [");
+        let mut spans = vec![Span::styled(prefix.clone(), style)];
         let edit_label = if state.settings.is_editing_custom_er_browser() {
             " editing"
         } else {
@@ -169,7 +165,7 @@ impl SettingsOverlay {
         };
         let suffix = format!("]{saved_label}{edit_label}");
         let input_width = usize::from(content.width)
-            .saturating_sub(5 + suffix.chars().count())
+            .saturating_sub(prefix.chars().count() + suffix.chars().count())
             .max(1);
         spans.extend(text_cursor_spans_with_kind(
             state.settings.custom_er_browser().content(),
