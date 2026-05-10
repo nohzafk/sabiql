@@ -135,7 +135,7 @@ fn open_with_browser(path: &Path, browser: &str) -> Result<(), ViewerError> {
     {
         Command::new("open")
             .arg("-a")
-            .arg(browser)
+            .arg(macos_browser_application_name(browser))
             .arg(path)
             .spawn()?;
         Ok(())
@@ -153,6 +153,14 @@ fn open_with_browser(path: &Path, browser: &str) -> Result<(), ViewerError> {
             .arg(path)
             .spawn()?;
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_browser_application_name(browser: &str) -> &str {
+    match browser.trim().to_ascii_lowercase().as_str() {
+        "brave" | "brave-browser" => "Brave Browser",
+        _ => browser,
     }
 }
 
@@ -565,6 +573,15 @@ mod tests {
             assert_eq!(
                 browser_command_candidates("CustomBrowser"),
                 vec!["CustomBrowser"]
+            );
+        }
+
+        #[test]
+        fn macos_browser_application_name_resolves_brave() {
+            assert_eq!(macos_browser_application_name("Brave"), "Brave Browser");
+            assert_eq!(
+                macos_browser_application_name("Brave Browser"),
+                "Brave Browser"
             );
         }
 
