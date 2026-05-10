@@ -152,6 +152,7 @@ pub enum InputTarget {
     QueryHistoryFilter,
     JsonbEdit,
     JsonbSearch,
+    HelpFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
