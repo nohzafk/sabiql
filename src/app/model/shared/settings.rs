@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn browser_choice_ignores_case() {
         assert_eq!(
-            ErBrowserChoice::from_browser_name(Some("google chrome")),
+            ErBrowserChoice::from_browser_name(Some("GOOGLE CHROME")),
             ErBrowserChoice::GoogleChrome
         );
         assert_eq!(

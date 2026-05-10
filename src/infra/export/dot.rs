@@ -172,6 +172,7 @@ fn browser_command_candidates(browser: &str) -> Vec<&str> {
             vec!["microsoft-edge", "microsoft-edge-stable"]
         }
         "brave" | "brave-browser" => vec!["brave-browser", "brave"],
+        // Arc stays under "Other"; this only helps typed values find likely launchers.
         "arc" => vec!["arc", "Arc"],
         _ => vec![browser],
     }
