@@ -26,7 +26,7 @@ use crate::primitives::atoms::scroll_indicator::{
     HorizontalScrollParams, VerticalScrollParams, clamp_scroll_offset,
     render_horizontal_scroll_indicator, render_vertical_scroll_indicator_bar,
 };
-use crate::primitives::molecules::render_modal;
+use crate::primitives::molecules::{FooterHintBar, render_modal};
 
 pub struct HelpOverlay;
 
@@ -37,7 +37,7 @@ impl HelpOverlay {
             Constraint::Percentage(HELP_MODAL_WIDTH_PERCENT),
             Constraint::Percentage(HELP_MODAL_HEIGHT_PERCENT),
             " Help ",
-            " ?/Esc Close ",
+            FooterHintBar::new([("?/Esc", "Close")]),
             theme,
         );
 
