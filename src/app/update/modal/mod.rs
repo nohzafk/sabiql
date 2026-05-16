@@ -1,514 +1,23 @@
+mod base;
+mod confirm_dialog;
+mod er_picker;
+mod help;
+mod query_history;
+mod settings;
+
 use std::time::Instant;
 
-use crate::catalog::HelpDocument;
-use crate::cmd::effect::Effect;
 use crate::model::app_state::AppState;
-use crate::model::shared::confirm_dialog::ConfirmIntent;
-use crate::model::shared::flash_timer::FlashId;
-use crate::model::shared::help::HelpOrigin;
-use crate::model::shared::input_mode::InputMode;
-use crate::ports::outbound::AppSettings;
-use crate::update::action::{
-    Action, InputTarget, ListMotion, ListTarget, ModalKind, ScrollAmount, ScrollDirection,
-    ScrollTarget,
-};
+use crate::update::action::Action;
 use crate::update::dispatch_result::DispatchResult;
 
-fn scroll_help_by(
-    state: &mut AppState,
-    direction: ScrollDirection,
-    delta: usize,
-    line_count: usize,
-    content_width: usize,
-) {
-    let max_scroll = state.ui.help_max_scroll(line_count, content_width);
-    let offset = direction.clamp_vertical_offset(state.ui.help.scroll_offset(), max_scroll, delta);
-    state.ui.help.set_scroll_offset(offset);
-}
-
-fn scroll_help_horizontally(state: &mut AppState, direction: ScrollDirection) {
-    match direction {
-        ScrollDirection::Left => {
-            state
-                .ui
-                .help
-                .set_horizontal_offset(state.ui.help.horizontal_offset().saturating_sub(1));
-        }
-        ScrollDirection::Right => {
-            let document = HelpDocument::from_state(state);
-            let max_scroll = state
-                .ui
-                .help_max_horizontal_scroll(document.line_count(), document.content_width());
-            state
-                .ui
-                .help
-                .set_horizontal_offset((state.ui.help.horizontal_offset() + 1).min(max_scroll));
-        }
-        ScrollDirection::Up | ScrollDirection::Down => {}
-    }
-}
-
-fn close_help(state: &mut AppState) {
-    state.modal.pop_mode();
-    state.ui.help.close();
-}
-
-pub fn reduce_modal(state: &mut AppState, action: &Action, now: Instant) -> DispatchResult {
-    match action {
-        Action::OpenModal(ModalKind::TablePicker) => {
-            state.modal.set_mode(InputMode::TablePicker);
-            state.ui.table_picker.clear_filter_and_reset();
-            DispatchResult::handled()
-        }
-        Action::CloseModal(ModalKind::TablePicker)
-        | Action::CloseModal(ModalKind::CommandPalette)
-        | Action::Escape => {
-            state.modal.set_mode(InputMode::Normal);
-            DispatchResult::handled()
-        }
-        Action::OpenModal(ModalKind::CommandPalette) => {
-            state.modal.set_mode(InputMode::CommandPalette);
-            // Command palette currently reuses the generic picker selection state.
-            state.ui.table_picker.reset();
-            DispatchResult::handled()
-        }
-        Action::OpenModal(ModalKind::Settings) => {
-            state.settings.open(state.ui.theme_id());
-            state.modal.set_mode(InputMode::Settings);
-            DispatchResult::handled()
-        }
-        Action::SettingsSelectNext => {
-            state.settings.select_next();
-            DispatchResult::handled()
-        }
-        Action::SettingsSelectPrevious => {
-            state.settings.select_previous();
-            DispatchResult::handled()
-        }
-        Action::SettingsNextSection => {
-            state.settings.switch_next_section();
-            DispatchResult::handled()
-        }
-        Action::SettingsPreviousSection => {
-            state.settings.switch_previous_section();
-            DispatchResult::handled()
-        }
-        Action::SettingsStartCustomBrowserEdit => {
-            state.settings.start_custom_browser_edit();
-            DispatchResult::handled()
-        }
-        Action::SettingsStopCustomBrowserEdit => {
-            state.settings.stop_custom_browser_edit();
-            DispatchResult::handled()
-        }
-        Action::TextInput {
-            target: InputTarget::SettingsErBrowser,
-            ch,
-        } => {
-            state.settings.input_custom_browser(*ch);
-            DispatchResult::handled()
-        }
-        Action::TextBackspace {
-            target: InputTarget::SettingsErBrowser,
-        } => {
-            state.settings.backspace_custom_browser();
-            DispatchResult::handled()
-        }
-        Action::TextDelete {
-            target: InputTarget::SettingsErBrowser,
-        } => {
-            state.settings.delete_custom_browser();
-            DispatchResult::handled()
-        }
-        Action::TextMoveCursor {
-            target: InputTarget::SettingsErBrowser,
-            direction,
-        } => {
-            state.settings.move_custom_browser_cursor(*direction);
-            DispatchResult::handled()
-        }
-        Action::SettingsApply => {
-            let theme_id = state.settings.selected_theme();
-            let settings = AppSettings {
-                theme_id,
-                er_browser: state.settings.selected_er_browser(),
-            };
-            DispatchResult::handled_with(vec![Effect::SaveSettings { settings }])
-        }
-        Action::SettingsCancel | Action::CloseModal(ModalKind::Settings) => {
-            state.settings.discard_selection();
-            state.modal.set_mode(InputMode::Normal);
-            DispatchResult::handled()
-        }
-        Action::SettingsSaved(settings) => {
-            state.ui.set_theme(settings.theme_id);
-            state
-                .settings
-                .commit_saved(settings.theme_id, settings.er_browser.clone());
-            state.set_success("Settings saved".to_string());
-            DispatchResult::handled()
-        }
-        Action::SettingsSaveFailed(error) => {
-            state.set_error(format!("Failed to save settings: {error}"));
-            DispatchResult::handled()
-        }
-        Action::ToggleModal(ModalKind::Help) => {
-            if state.modal.active_mode() == InputMode::Help {
-                close_help(state);
-            } else {
-                let origin = HelpOrigin::from_state(state);
-                state.ui.help.open(origin);
-                state.modal.push_mode(InputMode::Help);
-            }
-            DispatchResult::handled()
-        }
-        Action::CloseModal(ModalKind::Help) => {
-            close_help(state);
-            DispatchResult::handled()
-        }
-        Action::TextInput {
-            target: InputTarget::HelpFilter,
-            ch,
-        } => {
-            state.ui.help.insert_filter_char(*ch);
-            DispatchResult::handled()
-        }
-        Action::TextBackspace {
-            target: InputTarget::HelpFilter,
-        } => {
-            state.ui.help.backspace_filter();
-            DispatchResult::handled()
-        }
-        Action::Scroll {
-            target: ScrollTarget::Help,
-            direction,
-            amount,
-        } => {
-            match amount {
-                ScrollAmount::Line
-                    if matches!(direction, ScrollDirection::Left | ScrollDirection::Right) =>
-                {
-                    scroll_help_horizontally(state, *direction);
-                }
-                ScrollAmount::Line => {
-                    let document = HelpDocument::from_state(state);
-                    scroll_help_by(
-                        state,
-                        *direction,
-                        1,
-                        document.line_count(),
-                        document.content_width(),
-                    );
-                }
-                ScrollAmount::ToStart => {
-                    if matches!(direction, ScrollDirection::Left | ScrollDirection::Right) {
-                        state.ui.help.set_horizontal_offset(0);
-                    } else {
-                        state.ui.help.set_scroll_offset(0);
-                    }
-                }
-                ScrollAmount::ToEnd => {
-                    let document = HelpDocument::from_state(state);
-                    if matches!(direction, ScrollDirection::Left | ScrollDirection::Right) {
-                        let max_scroll = state.ui.help_max_horizontal_scroll(
-                            document.line_count(),
-                            document.content_width(),
-                        );
-                        state.ui.help.set_horizontal_offset(max_scroll);
-                    } else {
-                        let max_scroll = state
-                            .ui
-                            .help_max_scroll(document.line_count(), document.content_width());
-                        state.ui.help.set_scroll_offset(max_scroll);
-                    }
-                }
-                ScrollAmount::HalfPage | ScrollAmount::FullPage => {
-                    let document = HelpDocument::from_state(state);
-                    let line_count = document.line_count();
-                    let content_width = document.content_width();
-                    if let Some(delta) =
-                        amount.page_delta(state.ui.help_visible_rows(line_count, content_width))
-                    {
-                        scroll_help_by(state, *direction, delta, line_count, content_width);
-                    }
-                }
-                ScrollAmount::ViewportTop
-                | ScrollAmount::ViewportMiddle
-                | ScrollAmount::ViewportBottom => {}
-            }
-            DispatchResult::handled()
-        }
-        Action::Scroll {
-            target: ScrollTarget::ConfirmDialog,
-            direction,
-            amount: ScrollAmount::Line,
-        } => {
-            let max_scroll = state.confirm_dialog.max_scroll() as usize;
-            state.confirm_dialog.preview_scroll = direction.clamp_vertical_offset(
-                state.confirm_dialog.preview_scroll as usize,
-                max_scroll,
-                1,
-            ) as u16;
-            DispatchResult::handled()
-        }
-        Action::CloseModal(ModalKind::SqlModal) => {
-            state.modal.set_mode(InputMode::Normal);
-            state.sql_modal.cleanup_on_close();
-            state.flash_timers.clear(FlashId::SqlModal);
-            DispatchResult::handled()
-        }
-        Action::OpenModal(ModalKind::ErTablePicker) => {
-            if state.session.metadata().is_none() {
-                state.ui.pending_er_picker = true;
-                state.set_success("Waiting for metadata...".to_string());
-                return DispatchResult::handled();
-            }
-            state.ui.pending_er_picker = false;
-            state.ui.er_selected_tables.clear();
-            state.modal.set_mode(InputMode::ErTablePicker);
-            state.ui.er_picker.clear_filter_and_reset();
-            DispatchResult::handled()
-        }
-        Action::CloseModal(ModalKind::ErTablePicker) => {
-            state.modal.set_mode(InputMode::Normal);
-            state.ui.er_picker.clear_filter();
-            state.ui.er_selected_tables.clear();
-            state.ui.pending_er_picker = false;
-            DispatchResult::handled()
-        }
-        Action::TextInput {
-            target: InputTarget::ErFilter,
-            ch: c,
-        } => {
-            state.ui.er_picker.insert_filter_char(*c);
-            DispatchResult::handled()
-        }
-        Action::TextBackspace {
-            target: InputTarget::ErFilter,
-        } => {
-            state.ui.er_picker.backspace_filter();
-            DispatchResult::handled()
-        }
-        Action::TextMoveCursor {
-            target: InputTarget::ErFilter,
-            direction: movement,
-        } => {
-            state.ui.er_picker.move_filter_cursor(*movement);
-            DispatchResult::handled()
-        }
-        Action::ErToggleSelection => {
-            let filtered = state.er_filtered_tables();
-            if let Some(table) = filtered.get(state.ui.er_picker.selected()) {
-                let name = table.qualified_name();
-                if !state.ui.er_selected_tables.remove(&name) {
-                    state.ui.er_selected_tables.insert(name);
-                }
-            }
-            DispatchResult::handled()
-        }
-        Action::ErSelectAll => {
-            let all_tables: Vec<String> =
-                state.tables().iter().map(|t| t.qualified_name()).collect();
-            if state.ui.er_selected_tables.len() == all_tables.len() {
-                state.ui.er_selected_tables.clear();
-            } else {
-                state.ui.er_selected_tables = all_tables.into_iter().collect();
-            }
-            DispatchResult::handled()
-        }
-        Action::ErConfirmSelection => {
-            if state.ui.er_selected_tables.is_empty() {
-                state.set_error("No tables selected".to_string());
-                return DispatchResult::handled();
-            }
-            state.er_preparation.target_tables =
-                state.ui.er_selected_tables.iter().cloned().collect();
-            state.modal.set_mode(InputMode::Normal);
-            state.ui.er_picker.clear_filter();
-            state.ui.er_selected_tables.clear();
-            DispatchResult::handled_with(vec![Effect::DispatchActions(vec![Action::ErOpenDiagram])])
-        }
-        Action::OpenModal(ModalKind::QueryHistoryPicker) => {
-            if state.session.active_connection_id.is_none() {
-                return DispatchResult::handled();
-            }
-            if state.query.is_running() {
-                return DispatchResult::handled();
-            }
-            if state.modal.active_mode() == InputMode::ConfirmDialog {
-                return DispatchResult::handled();
-            }
-            if state.sql_modal.completion().visible
-                && !state.sql_modal.completion().candidates.is_empty()
-            {
-                return DispatchResult::handled();
-            }
-
-            state.query_history_picker.reset();
-            state.modal.push_mode(InputMode::QueryHistoryPicker);
-
-            let conn_id = state.session.active_connection_id.as_ref().unwrap();
-            DispatchResult::handled_with(vec![Effect::LoadQueryHistory {
-                project_name: state.runtime.project_name.clone(),
-                connection_id: conn_id.clone(),
-            }])
-        }
-        Action::CloseModal(ModalKind::QueryHistoryPicker) => {
-            state.modal.pop_mode();
-            state.query_history_picker.reset();
-            DispatchResult::handled()
-        }
-        Action::QueryHistoryLoaded(conn_id, entries) => {
-            if state.modal.active_mode() != InputMode::QueryHistoryPicker {
-                return DispatchResult::handled();
-            }
-            if state.session.active_connection_id.as_ref() != Some(conn_id) {
-                return DispatchResult::handled();
-            }
-            state.query_history_picker.replace_entries(entries);
-            DispatchResult::handled()
-        }
-        Action::QueryHistoryLoadFailed(e) => {
-            if state.modal.active_mode() != InputMode::QueryHistoryPicker {
-                return DispatchResult::handled();
-            }
-            state.messages.set_error_at(e.to_string(), now);
-            DispatchResult::handled()
-        }
-        Action::QueryHistoryAppendFailed(_) => DispatchResult::handled(),
-        Action::TextInput {
-            target: InputTarget::QueryHistoryFilter,
-            ch: c,
-        } => {
-            state.query_history_picker.insert_filter_char(*c);
-            DispatchResult::handled()
-        }
-        Action::TextBackspace {
-            target: InputTarget::QueryHistoryFilter,
-        } => {
-            state.query_history_picker.backspace_filter();
-            DispatchResult::handled()
-        }
-        Action::ListSelect {
-            target: ListTarget::QueryHistory,
-            motion: ListMotion::Next,
-        } => {
-            state.query_history_picker.select_next();
-            DispatchResult::handled()
-        }
-        Action::ListSelect {
-            target: ListTarget::QueryHistory,
-            motion: ListMotion::Previous,
-        } => {
-            state.query_history_picker.select_previous();
-            DispatchResult::handled()
-        }
-        Action::QueryHistoryConfirmSelection => {
-            let grouped = state.query_history_picker.grouped_filtered_entries();
-            let selected = state.query_history_picker.clamped_selected();
-            let query = grouped.get(selected).map(|g| g.entry.query.clone());
-            let origin = state.modal.pop_mode();
-
-            state.query_history_picker.reset();
-
-            let Some(query) = query else {
-                return DispatchResult::handled();
-            };
-
-            match origin {
-                InputMode::Normal => {
-                    state.modal.set_mode(InputMode::SqlModal);
-                    state.sql_modal.load_query_from_history(query);
-                }
-                InputMode::SqlModal => {
-                    state.sql_modal.load_query_from_history(query);
-                }
-                _ => {}
-            }
-            DispatchResult::handled()
-        }
-
-        Action::ConfirmDialogConfirm => {
-            let intent = state.confirm_dialog.take_intent();
-            state.modal.pop_mode();
-
-            match intent {
-                Some(ConfirmIntent::QuitNoConnection) => {
-                    state.should_quit = true;
-                    DispatchResult::handled()
-                }
-                Some(ConfirmIntent::DeleteConnection(id)) => {
-                    DispatchResult::handled_with(vec![Effect::DeleteConnection { id }])
-                }
-                Some(ConfirmIntent::ExecuteWrite { blocked: true, .. }) => {
-                    state.result_interaction.clear_write_preview();
-                    state.query.clear_delete_refresh_target();
-                    DispatchResult::handled()
-                }
-                Some(ConfirmIntent::ExecuteWrite {
-                    sql,
-                    blocked: false,
-                }) => {
-                    if let Some(dsn) = &state.session.dsn {
-                        state.query.begin_running(now);
-                        DispatchResult::handled_with(vec![Effect::ExecuteWrite {
-                            dsn: dsn.clone(),
-                            query: sql,
-                            read_only: state.session.read_only,
-                        }])
-                    } else {
-                        state.result_interaction.clear_write_preview();
-                        state.query.clear_delete_refresh_target();
-                        state
-                            .messages
-                            .set_error_at("No active connection".to_string(), now);
-                        DispatchResult::handled()
-                    }
-                }
-                Some(ConfirmIntent::DisableReadOnly) => {
-                    state.session.read_only = false;
-                    DispatchResult::handled()
-                }
-                Some(ConfirmIntent::CsvExport {
-                    export_query,
-                    file_name,
-                    row_count,
-                }) => {
-                    if let Some(dsn) = &state.session.dsn {
-                        DispatchResult::handled_with(vec![Effect::ExportCsv {
-                            dsn: dsn.clone(),
-                            query: export_query,
-                            file_name,
-                            row_count,
-                            read_only: state.session.read_only,
-                        }])
-                    } else {
-                        DispatchResult::handled()
-                    }
-                }
-                None => DispatchResult::handled(),
-            }
-        }
-        Action::ConfirmDialogCancel => {
-            let intent = state.confirm_dialog.take_intent();
-            state.result_interaction.clear_write_preview();
-            state.query.clear_delete_refresh_target();
-
-            if matches!(intent, Some(ConfirmIntent::QuitNoConnection)) {
-                state.connection_setup.reset();
-                if !state.connections().is_empty() || state.session.dsn.is_some() {
-                    state.connection_setup.is_first_run = false;
-                }
-                state.modal.pop_mode_override(InputMode::ConnectionSetup);
-                DispatchResult::handled()
-            } else {
-                state.modal.pop_mode();
-                DispatchResult::handled()
-            }
-        }
-
-        _ => DispatchResult::pass(),
-    }
+pub fn dispatch_modal(state: &mut AppState, action: &Action, now: Instant) -> DispatchResult {
+    base::reduce_base_lifecycle(state, action, now)
+        .or_else(|| settings::reduce_settings(state, action, now))
+        .or_else(|| help::reduce_help(state, action, now))
+        .or_else(|| confirm_dialog::reduce_confirm_dialog(state, action, now))
+        .or_else(|| er_picker::reduce_er_picker(state, action, now))
+        .or_else(|| query_history::reduce_query_history_picker(state, action, now))
 }
 
 #[cfg(test)]
@@ -516,7 +25,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::cmd::effect::Effect;
     use crate::model::shared::confirm_dialog::ConfirmIntent;
+    use crate::model::shared::input_mode::InputMode;
+    use crate::ports::outbound::AppSettings;
+    use crate::update::action::{
+        InputTarget, ListMotion, ListTarget, ModalKind, ScrollAmount, ScrollDirection, ScrollTarget,
+    };
 
     use std::time::Instant;
 
@@ -524,16 +39,43 @@ mod tests {
         AppState::new("test".to_string())
     }
 
+    mod base {
+        use super::*;
+
+        #[test]
+        fn escape_closes_connection_selector() {
+            let mut state = create_test_state();
+            state.modal.set_mode(InputMode::ConnectionSelector);
+
+            let effects =
+                super::dispatch_modal(&mut state, &Action::Escape, Instant::now()).unwrap();
+
+            assert_eq!(state.input_mode(), InputMode::Normal);
+            assert!(effects.is_empty());
+        }
+
+        #[test]
+        fn escape_passes_for_modal_with_specific_close_action() {
+            let mut state = create_test_state();
+            state.modal.set_mode(InputMode::SqlModal);
+
+            let result = super::dispatch_modal(&mut state, &Action::Escape, Instant::now());
+
+            assert!(result.is_pass());
+            assert_eq!(state.input_mode(), InputMode::SqlModal);
+        }
+    }
+
     mod help {
         use super::*;
 
         fn open_help(state: &mut AppState) {
-            reduce_modal(
+            super::dispatch_modal(
                 state,
                 &Action::OpenModal(ModalKind::CommandPalette),
                 Instant::now(),
             );
-            reduce_modal(state, &Action::ToggleModal(ModalKind::Help), Instant::now());
+            super::dispatch_modal(state, &Action::ToggleModal(ModalKind::Help), Instant::now());
             assert_eq!(state.input_mode(), InputMode::Help);
         }
 
@@ -543,7 +85,7 @@ mod tests {
             open_help(&mut state);
             state.ui.help.insert_filter_char('c');
 
-            let effects = reduce_modal(
+            let effects = super::dispatch_modal(
                 &mut state,
                 &Action::CloseModal(ModalKind::Help),
                 Instant::now(),
@@ -560,7 +102,7 @@ mod tests {
             let mut state = create_test_state();
             open_help(&mut state);
 
-            let effects = reduce_modal(
+            let effects = super::dispatch_modal(
                 &mut state,
                 &Action::CloseModal(ModalKind::Help),
                 Instant::now(),
@@ -576,7 +118,7 @@ mod tests {
             let mut state = create_test_state();
             open_help(&mut state);
 
-            let input_effects = reduce_modal(
+            let input_effects = super::dispatch_modal(
                 &mut state,
                 &Action::TextInput {
                     target: InputTarget::HelpFilter,
@@ -585,7 +127,7 @@ mod tests {
                 Instant::now(),
             )
             .unwrap();
-            let backspace_effects = reduce_modal(
+            let backspace_effects = super::dispatch_modal(
                 &mut state,
                 &Action::TextBackspace {
                     target: InputTarget::HelpFilter,
@@ -613,7 +155,7 @@ mod tests {
                 let mut state = create_test_state();
                 state.ui.set_theme(ThemeId::Light);
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
@@ -629,13 +171,13 @@ mod tests {
             #[test]
             fn navigates_without_applying() {
                 let mut state = create_test_state();
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
 
-                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
                 assert_eq!(state.settings.selected_theme(), ThemeId::Light);
                 assert_eq!(state.ui.theme_id(), ThemeId::Default);
@@ -646,14 +188,14 @@ mod tests {
             #[case(Action::CloseModal(ModalKind::Settings))]
             fn cancel_discards_selection(#[case] action: Action) {
                 let mut state = create_test_state();
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
-                let effects = reduce_modal(&mut state, &action, Instant::now())
+                let effects = super::dispatch_modal(&mut state, &action, Instant::now())
                     .into_effects()
                     .expect("reducer should handle action");
 
@@ -666,16 +208,17 @@ mod tests {
             #[test]
             fn apply_emits_settings_save_effect() {
                 let mut state = create_test_state();
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
-                let effects = reduce_modal(&mut state, &Action::SettingsApply, Instant::now())
-                    .into_effects()
-                    .expect("reducer should handle action");
+                let effects =
+                    super::dispatch_modal(&mut state, &Action::SettingsApply, Instant::now())
+                        .into_effects()
+                        .expect("reducer should handle action");
 
                 assert_eq!(state.input_mode(), InputMode::Settings);
                 assert_eq!(state.ui.theme_id(), ThemeId::Default);
@@ -689,17 +232,18 @@ mod tests {
             #[test]
             fn apply_emits_er_browser_save_effect() {
                 let mut state = create_test_state();
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsNextSection, Instant::now());
-                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsNextSection, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
-                let effects = reduce_modal(&mut state, &Action::SettingsApply, Instant::now())
-                    .into_effects()
-                    .expect("reducer should handle action");
+                let effects =
+                    super::dispatch_modal(&mut state, &Action::SettingsApply, Instant::now())
+                        .into_effects()
+                        .expect("reducer should handle action");
 
                 assert_eq!(state.input_mode(), InputMode::Settings);
                 assert_eq!(state.settings.saved_er_browser(), None);
@@ -713,18 +257,18 @@ mod tests {
             #[test]
             fn custom_browser_input_is_saved() {
                 let mut state = create_test_state();
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsNextSection, Instant::now());
-                reduce_modal(
+                super::dispatch_modal(&mut state, &Action::SettingsNextSection, Instant::now());
+                super::dispatch_modal(
                     &mut state,
                     &Action::SettingsStartCustomBrowserEdit,
                     Instant::now(),
                 );
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::TextInput {
                         target: InputTarget::SettingsErBrowser,
@@ -733,9 +277,10 @@ mod tests {
                     Instant::now(),
                 );
 
-                let effects = reduce_modal(&mut state, &Action::SettingsApply, Instant::now())
-                    .into_effects()
-                    .expect("reducer should handle action");
+                let effects =
+                    super::dispatch_modal(&mut state, &Action::SettingsApply, Instant::now())
+                        .into_effects()
+                        .expect("reducer should handle action");
 
                 assert_eq!(state.input_mode(), InputMode::Settings);
                 assert!(matches!(
@@ -748,16 +293,16 @@ mod tests {
             #[test]
             fn save_success_commits_pending_settings() {
                 let mut state = create_test_state();
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::Settings),
                     Instant::now(),
                 );
-                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
-                reduce_modal(&mut state, &Action::SettingsNextSection, Instant::now());
-                reduce_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsNextSection, Instant::now());
+                super::dispatch_modal(&mut state, &Action::SettingsSelectNext, Instant::now());
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::SettingsSaved(AppSettings {
                         theme_id: ThemeId::Light,
@@ -785,7 +330,7 @@ mod tests {
         fn save_failed_sets_error_message() {
             let mut state = create_test_state();
 
-            let effects = reduce_modal(
+            let effects = super::dispatch_modal(
                 &mut state,
                 &Action::SettingsSaveFailed(crate::ports::outbound::SettingsStoreError::Io(
                     std::sync::Arc::new(std::io::Error::other("disk full")),
@@ -820,9 +365,12 @@ mod tests {
                     .confirm_dialog
                     .open("", "", ConfirmIntent::QuitNoConnection);
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert!(state.should_quit);
                 assert!(state.confirm_dialog.intent().is_none());
@@ -838,9 +386,12 @@ mod tests {
                     .confirm_dialog
                     .open("", "", ConfirmIntent::DeleteConnection(id));
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert_eq!(state.input_mode(), InputMode::ConnectionSelector);
                 assert_eq!(effects.len(), 1);
@@ -862,7 +413,7 @@ mod tests {
                 );
 
                 let now = Instant::now();
-                let effects = reduce_modal(&mut state, &Action::ConfirmDialogConfirm, now)
+                let effects = super::dispatch_modal(&mut state, &Action::ConfirmDialogConfirm, now)
                     .into_effects()
                     .expect("reducer should handle action");
 
@@ -887,9 +438,12 @@ mod tests {
                     },
                 );
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert!(effects.is_empty());
                 assert_eq!(
@@ -911,9 +465,12 @@ mod tests {
                     },
                 );
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert_eq!(state.input_mode(), InputMode::Normal);
                 assert!(effects.is_empty());
@@ -951,7 +508,7 @@ mod tests {
                     },
                 );
 
-                reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
+                super::dispatch_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
                     .into_effects()
                     .expect("reducer should handle action");
 
@@ -974,9 +531,12 @@ mod tests {
                     },
                 );
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert_eq!(effects.len(), 1);
                 assert!(matches!(&effects[0], Effect::ExportCsv { .. }));
@@ -991,9 +551,12 @@ mod tests {
                     .confirm_dialog
                     .open("", "", ConfirmIntent::DisableReadOnly);
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert!(!state.session.read_only);
                 assert_eq!(state.input_mode(), InputMode::Normal);
@@ -1005,9 +568,12 @@ mod tests {
                 let mut state = create_test_state();
                 enter_confirm_dialog(&mut state, InputMode::Normal);
 
-                let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogConfirm, Instant::now())
-                        .unwrap();
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::ConfirmDialogConfirm,
+                    Instant::now(),
+                )
+                .unwrap();
 
                 assert!(effects.is_empty());
             }
@@ -1036,7 +602,7 @@ mod tests {
             fn down_increments_offset() {
                 let mut state = state_with_scrollable_preview();
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::Scroll {
                         target: ScrollTarget::ConfirmDialog,
@@ -1054,7 +620,7 @@ mod tests {
                 let mut state = state_with_scrollable_preview();
                 state.confirm_dialog.preview_scroll = 5;
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::Scroll {
                         target: ScrollTarget::ConfirmDialog,
@@ -1072,7 +638,7 @@ mod tests {
                 let mut state = state_with_scrollable_preview();
                 state.confirm_dialog.preview_scroll = 0;
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::Scroll {
                         target: ScrollTarget::ConfirmDialog,
@@ -1090,7 +656,7 @@ mod tests {
                 let mut state = state_with_scrollable_preview();
                 state.confirm_dialog.preview_scroll = 15;
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::Scroll {
                         target: ScrollTarget::ConfirmDialog,
@@ -1135,7 +701,7 @@ mod tests {
                     .open("", "", ConfirmIntent::QuitNoConnection);
 
                 let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogCancel, Instant::now())
+                    super::dispatch_modal(&mut state, &Action::ConfirmDialogCancel, Instant::now())
                         .into_effects()
                         .expect("reducer should handle action");
 
@@ -1157,7 +723,7 @@ mod tests {
                 );
 
                 let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogCancel, Instant::now())
+                    super::dispatch_modal(&mut state, &Action::ConfirmDialogCancel, Instant::now())
                         .into_effects()
                         .expect("reducer should handle action");
 
@@ -1172,7 +738,7 @@ mod tests {
                 enter_confirm_dialog(&mut state, InputMode::Normal);
 
                 let effects =
-                    reduce_modal(&mut state, &Action::ConfirmDialogCancel, Instant::now())
+                    super::dispatch_modal(&mut state, &Action::ConfirmDialogCancel, Instant::now())
                         .into_effects()
                         .expect("reducer should handle action");
 
@@ -1218,7 +784,7 @@ mod tests {
                 let mut state = create_test_state();
                 state.session.active_connection_id = None;
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::QueryHistoryPicker),
                     Instant::now(),
@@ -1234,7 +800,7 @@ mod tests {
                 let mut state = connected_state();
                 state.query.begin_running(Instant::now());
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::QueryHistoryPicker),
                     Instant::now(),
@@ -1253,7 +819,7 @@ mod tests {
             fn open_from_normal_sets_mode_and_emits_load_effect() {
                 let mut state = connected_state();
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::OpenModal(ModalKind::QueryHistoryPicker),
                     Instant::now(),
@@ -1267,12 +833,29 @@ mod tests {
             }
 
             #[test]
+            fn open_while_already_open_is_noop() {
+                let mut state = connected_state();
+                state.modal.push_mode(InputMode::QueryHistoryPicker);
+
+                let effects = super::dispatch_modal(
+                    &mut state,
+                    &Action::OpenModal(ModalKind::QueryHistoryPicker),
+                    Instant::now(),
+                )
+                .unwrap();
+
+                assert_eq!(state.input_mode(), InputMode::QueryHistoryPicker);
+                assert_eq!(state.modal.return_destination(), InputMode::Normal);
+                assert!(effects.is_empty());
+            }
+
+            #[test]
             fn close_restores_origin_mode() {
                 let mut state = connected_state();
                 state.modal.set_mode(InputMode::SqlModal);
                 state.modal.push_mode(InputMode::QueryHistoryPicker);
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::CloseModal(ModalKind::QueryHistoryPicker),
                     Instant::now(),
@@ -1294,7 +877,7 @@ mod tests {
                 let conn_id = ConnectionId::from_string("test-conn");
                 let entries = vec![make_entry("SELECT 1", &conn_id)];
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryLoaded(conn_id, entries),
                     Instant::now(),
@@ -1312,7 +895,7 @@ mod tests {
                 let stale_conn = ConnectionId::from_string("old-conn");
                 let entries = vec![make_entry("SELECT 1", &stale_conn)];
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryLoaded(stale_conn, entries),
                     Instant::now(),
@@ -1328,7 +911,7 @@ mod tests {
                 let conn_id = ConnectionId::from_string("test-conn");
                 let entries = vec![make_entry("SELECT 1", &conn_id)];
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryLoaded(conn_id, entries),
                     Instant::now(),
@@ -1344,7 +927,7 @@ mod tests {
                 state.modal.set_mode(InputMode::QueryHistoryPicker);
                 let now = Instant::now();
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryLoadFailed(QueryHistoryError::Io(Arc::new(
                         std::io::Error::other("disk error"),
@@ -1365,7 +948,7 @@ mod tests {
                 let mut state = connected_state();
                 let now = Instant::now();
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryLoadFailed(QueryHistoryError::Io(Arc::new(
                         std::io::Error::other("stale error"),
@@ -1382,7 +965,7 @@ mod tests {
                 let mut state = connected_state();
                 let now = Instant::now();
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryAppendFailed(QueryHistoryError::Io(Arc::new(
                         std::io::Error::other("write error"),
@@ -1404,7 +987,7 @@ mod tests {
                 let mut state = connected_state();
                 state.query_history_picker.set_selection_for_test(5);
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::TextInput {
                         target: InputTarget::QueryHistoryFilter,
@@ -1428,7 +1011,7 @@ mod tests {
                     make_entry("SELECT 2", &test_conn),
                 ]);
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::ListSelect {
                         target: ListTarget::QueryHistory,
@@ -1449,7 +1032,7 @@ mod tests {
                     .query_history_picker
                     .replace_entries(&[make_entry("SELECT 1", &test_conn)]);
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::ListSelect {
                         target: ListTarget::QueryHistory,
@@ -1467,7 +1050,7 @@ mod tests {
                 let mut state = connected_state();
                 state.query_history_picker.set_selection_for_test(1);
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::ListSelect {
                         target: ListTarget::QueryHistory,
@@ -1497,7 +1080,7 @@ mod tests {
                     .query_history_picker
                     .replace_entries(&[make_entry(&query, &test_conn)]);
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryConfirmSelection,
                     Instant::now(),
@@ -1516,7 +1099,7 @@ mod tests {
                     .query_history_picker
                     .replace_entries(&[make_entry("SELECT * FROM users", &test_conn)]);
 
-                let effects = reduce_modal(
+                let effects = super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryConfirmSelection,
                     Instant::now(),
@@ -1553,7 +1136,7 @@ mod tests {
                     .query_history_picker
                     .replace_entries(&[make_entry("new query", &test_conn)]);
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryConfirmSelection,
                     Instant::now(),
@@ -1576,7 +1159,7 @@ mod tests {
                 let mut state = connected_state();
                 enter_query_history(&mut state, InputMode::Normal);
 
-                reduce_modal(
+                super::dispatch_modal(
                     &mut state,
                     &Action::QueryHistoryConfirmSelection,
                     Instant::now(),

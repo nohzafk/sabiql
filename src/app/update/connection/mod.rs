@@ -11,16 +11,16 @@ use crate::services::AppServices;
 use crate::update::action::Action;
 use crate::update::dispatch_result::DispatchResult;
 
-pub fn reduce_connection(
+pub fn dispatch_connection(
     state: &mut AppState,
     action: &Action,
     now: Instant,
     services: &AppServices,
 ) -> DispatchResult {
-    lifecycle::reduce(state, action, now, services)
-        .or_else(|| setup::reduce(state, action, now))
-        .or_else(|| error::reduce(state, action, now))
-        .or_else(|| selector::reduce(state, action, now))
+    lifecycle::reduce_connection_lifecycle(state, action, now, services)
+        .or_else(|| setup::reduce_connection_setup(state, action, now))
+        .or_else(|| error::reduce_connection_error(state, action, now))
+        .or_else(|| selector::reduce_connection_selector(state, action, now))
 }
 
 #[cfg(test)]
@@ -33,7 +33,7 @@ mod tests {
         let mut state = AppState::new("test".to_string());
         state.modal.set_mode(InputMode::ConnectionSetup);
 
-        let result = reduce_connection(
+        let result = dispatch_connection(
             &mut state,
             &Action::Paste("hello".to_string()),
             Instant::now(),
@@ -48,7 +48,7 @@ mod tests {
         let mut state = AppState::new("test".to_string());
         state.modal.set_mode(InputMode::Normal);
 
-        let result = reduce_connection(
+        let result = dispatch_connection(
             &mut state,
             &Action::Paste("hello".to_string()),
             Instant::now(),
@@ -62,7 +62,7 @@ mod tests {
     fn unknown_action_returns_none() {
         let mut state = AppState::new("test".to_string());
 
-        let result = reduce_connection(
+        let result = dispatch_connection(
             &mut state,
             &Action::Quit,
             Instant::now(),

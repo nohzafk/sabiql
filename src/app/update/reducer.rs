@@ -7,8 +7,8 @@
 use std::time::Instant;
 
 use super::{
-    reduce_connection, reduce_er, reduce_explain_with_services, reduce_metadata, reduce_modal,
-    reduce_navigation, reduce_query, reduce_result, reduce_sql_modal,
+    dispatch_connection, dispatch_er, dispatch_explain, dispatch_modal, dispatch_sql_modal,
+    reduce_metadata, reduce_navigation, reduce_query, reduce_result,
 };
 use crate::catalog::HelpDocument;
 use crate::cmd::effect::Effect;
@@ -46,16 +46,16 @@ fn reduce_inner(
 ) -> Vec<Effect> {
     state.result_interaction.clear_operator_pending();
 
-    if let Some(effects) = reduce_connection(state, &action, now, services)
-        .or_else(|| reduce_modal(state, &action, now))
+    if let Some(effects) = dispatch_connection(state, &action, now, services)
+        .or_else(|| dispatch_modal(state, &action, now))
         // reduce_result must precede reduce_query: passthrough actions (e.g. ResultNextPage)
         // reset view state here and return Pass, relying on reduce_query for the page change.
         .or_else(|| reduce_result(state, &action, services, now))
         .or_else(|| reduce_navigation(state, &action, services, now))
-        .or_else(|| reduce_sql_modal(state, &action, now, services))
-        .or_else(|| reduce_explain_with_services(state, &action, now, services))
+        .or_else(|| dispatch_sql_modal(state, &action, now, services))
+        .or_else(|| dispatch_explain(state, &action, now, services))
         .or_else(|| reduce_metadata(state, &action, now))
-        .or_else(|| reduce_er(state, &action, now))
+        .or_else(|| dispatch_er(state, &action, now))
         .or_else(|| reduce_query(state, &action, now, services))
         .into_effects()
     {
@@ -2676,6 +2676,39 @@ mod tests {
                 assert_eq!(schema, "public");
                 assert_eq!(table, "users");
             }
+        }
+
+        #[test]
+        fn prev_page_after_confirm_flows_through_result_to_query() {
+            let (mut state, now) = state_after_confirm_and_complete();
+            state.query.pagination.current_page = 1;
+            state.query.pagination.reached_end = true;
+
+            let effects = reduce(
+                &mut state,
+                Action::ResultPrevPage,
+                now,
+                &AppServices::stub(),
+            );
+
+            let preview_effect = effects
+                .iter()
+                .find(|e| matches!(e, Effect::ExecutePreview { .. }));
+            assert!(preview_effect.is_some());
+            if let Some(Effect::ExecutePreview {
+                offset,
+                target_page,
+                schema,
+                table,
+                ..
+            }) = preview_effect
+            {
+                assert_eq!(*offset, 0);
+                assert_eq!(*target_page, 0);
+                assert_eq!(schema, "public");
+                assert_eq!(table, "users");
+            }
+            assert!(!state.query.pagination.reached_end);
         }
     }
 
