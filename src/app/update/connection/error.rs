@@ -4,24 +4,29 @@ use crate::cmd::effect::Effect;
 use crate::model::app_state::AppState;
 use crate::model::shared::input_mode::InputMode;
 use crate::update::action::{Action, ScrollAmount, ScrollDirection, ScrollTarget};
+use crate::update::dispatch_result::DispatchResult;
 
-pub fn reduce(state: &mut AppState, action: &Action, now: Instant) -> Option<Vec<Effect>> {
+pub(super) fn reduce_connection_error(
+    state: &mut AppState,
+    action: &Action,
+    now: Instant,
+) -> DispatchResult {
     match action {
         Action::ShowConnectionError(info) => {
             state.connection_error.set_error(info.clone());
             state.modal.replace_mode(InputMode::ConnectionError);
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::CloseConnectionError => {
             state.connection_error.details_expanded = false;
             state.connection_error.scroll_offset = 0;
             state.connection_error.clear_copied_feedback();
             state.modal.set_mode(InputMode::Normal);
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::ToggleConnectionErrorDetails => {
             state.connection_error.toggle_details();
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::Scroll {
             target: ScrollTarget::ConnectionError,
@@ -29,7 +34,7 @@ pub fn reduce(state: &mut AppState, action: &Action, now: Instant) -> Option<Vec
             amount: ScrollAmount::Line,
         } => {
             state.connection_error.scroll_up();
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::Scroll {
             target: ScrollTarget::ConnectionError,
@@ -41,45 +46,45 @@ pub fn reduce(state: &mut AppState, action: &Action, now: Instant) -> Option<Vec
             // is not subtracted. Acceptable for typical short psql errors.
             let max_scroll = state.connection_error.detail_line_count().saturating_sub(1);
             state.connection_error.scroll_down(max_scroll);
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::CopyConnectionError => {
             if let Some(content) = state.connection_error.masked_details() {
-                Some(vec![Effect::CopyToClipboard {
+                DispatchResult::handled_with(vec![Effect::CopyToClipboard {
                     content: content.to_string(),
-                    on_success: Some(Action::ConnectionErrorCopied),
+                    on_success: Some(Box::new(Action::ConnectionErrorCopied)),
                     on_failure: None,
                 }])
             } else {
-                Some(vec![])
+                DispatchResult::handled()
             }
         }
         Action::ConnectionErrorCopied => {
             state.connection_error.mark_copied_at(now);
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::ReenterConnectionSetup => {
             if state.session.is_service_connection() {
-                return Some(vec![]);
+                return DispatchResult::handled();
             }
             state.connection_error.clear();
             state.session.mark_disconnected();
             state.modal.replace_mode(InputMode::ConnectionSetup);
-            Some(vec![])
+            DispatchResult::handled()
         }
         Action::RetryServiceConnection => {
             if let Some(dsn) = state.session.dsn.clone() {
                 state.connection_error.clear();
-                state.session.begin_connecting(&dsn);
+                let run_id = state.session.begin_connecting(&dsn);
                 state.session.read_only = false;
                 state.modal.set_mode(InputMode::Normal);
-                Some(vec![Effect::FetchMetadata { dsn }])
+                DispatchResult::handled_with(vec![Effect::FetchMetadata { dsn, run_id }])
             } else {
-                Some(vec![])
+                DispatchResult::handled()
             }
         }
 
-        _ => None,
+        _ => DispatchResult::pass(),
     }
 }
 
@@ -112,11 +117,11 @@ mod tests {
             let action = scroll_down_action();
             let now = Instant::now();
 
-            reduce(&mut state, &action, now);
-            reduce(&mut state, &action, now);
+            reduce_connection_error(&mut state, &action, now);
+            reduce_connection_error(&mut state, &action, now);
             assert_eq!(state.connection_error.scroll_offset, 2);
 
-            reduce(&mut state, &action, now);
+            reduce_connection_error(&mut state, &action, now);
             assert_eq!(state.connection_error.scroll_offset, 2);
         }
     }
@@ -130,7 +135,7 @@ mod tests {
             state.session.dsn = Some("service=mydb".to_string());
             state.modal.set_mode(InputMode::ConnectionError);
 
-            reduce(&mut state, &Action::ReenterConnectionSetup, Instant::now());
+            reduce_connection_error(&mut state, &Action::ReenterConnectionSetup, Instant::now());
 
             assert_eq!(state.input_mode(), InputMode::ConnectionError);
         }
@@ -141,7 +146,7 @@ mod tests {
             state.session.dsn = Some("postgres://localhost/db".to_string());
             state.modal.set_mode(InputMode::ConnectionError);
 
-            reduce(&mut state, &Action::ReenterConnectionSetup, Instant::now());
+            reduce_connection_error(&mut state, &Action::ReenterConnectionSetup, Instant::now());
 
             assert_eq!(state.input_mode(), InputMode::ConnectionSetup);
         }

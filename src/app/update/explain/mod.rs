@@ -1,316 +1,55 @@
+mod analyze;
+mod helpers;
+mod request;
+mod result;
+mod scroll;
+mod tabs;
+
 use std::time::Instant;
 
-use crate::cmd::effect::Effect;
 use crate::model::app_state::AppState;
-use crate::model::explain_context::ExplainContext;
-use crate::model::shared::text_input::TextInputLike;
-use crate::model::sql_editor::modal::{SqlModalStatus, SqlModalTab};
-use crate::policy::sql::statement_classifier::{self, StatementKind};
-use crate::policy::write::sql_risk::{ConfirmationType, evaluate_sql_risk, split_statements};
 use crate::services::AppServices;
-use crate::update::action::{Action, ScrollAmount, ScrollTarget};
+use crate::update::action::Action;
+use crate::update::dispatch_result::DispatchResult;
 
-fn is_multi_statement(content: &str) -> bool {
-    split_statements(content).len() > 1
-}
-
-fn mark_explain_unavailable(state: &mut AppState, services: &AppServices) {
-    state
-        .explain
-        .set_error("EXPLAIN is unavailable for this database".to_string());
-    let tab = services
-        .db_capabilities
-        .normalize_sql_modal_tab(state.sql_modal.active_tab());
-    state.sql_modal.set_active_tab(tab);
-}
-
-fn show_explain_error_on_plan(state: &mut AppState, message: impl Into<String>) {
-    state.explain.set_error(message.into());
-    state.sql_modal.set_active_tab(SqlModalTab::Plan);
-}
-
-fn begin_explain_running(state: &mut AppState, now: Instant) {
-    state.sql_modal.begin_adhoc_running();
-    state.sql_modal.set_active_tab(SqlModalTab::Plan);
-    state.explain.reset();
-    state.query.begin_running(now);
-}
-
-fn finish_explain_success(
-    state: &mut AppState,
-    plan_text: String,
-    is_analyze: bool,
-    execution_time_ms: u64,
-    query: &str,
-) {
-    state
-        .explain
-        .set_plan(plan_text, is_analyze, execution_time_ms, query);
-    state.sql_modal.enter_normal();
-    state.sql_modal.set_active_tab(SqlModalTab::Plan);
-    state.query.mark_idle();
-}
-
-fn finish_explain_error(state: &mut AppState, error: impl Into<String>) {
-    state.explain.set_error(error.into());
-    state.sql_modal.enter_normal();
-    state.sql_modal.set_active_tab(SqlModalTab::Plan);
-    state.query.mark_idle();
-}
-
-fn reject_unsupported_explain(state: &mut AppState, services: &AppServices) -> bool {
-    if services.db_capabilities.supports_explain() {
-        return false;
-    }
-
-    mark_explain_unavailable(state, services);
-    true
-}
-
-pub fn reduce_explain_with_services(
+pub fn dispatch_explain(
     state: &mut AppState,
     action: &Action,
     now: Instant,
     services: &AppServices,
-) -> Option<Vec<Effect>> {
-    match action {
-        Action::ExplainRequest => {
-            if reject_unsupported_explain(state, services) {
-                return Some(vec![]);
-            }
-            let content = state.sql_modal.editor.content().trim().to_string();
-            if content.is_empty() {
-                return Some(vec![]);
-            }
-            let Some(dsn) = state.session.dsn.clone() else {
-                return Some(vec![]);
-            };
-            if matches!(state.sql_modal.status(), SqlModalStatus::Running) {
-                return Some(vec![]);
-            }
-            if is_multi_statement(&content) {
-                show_explain_error_on_plan(state, "EXPLAIN does not support multiple statements");
-                return Some(vec![]);
-            }
-
-            let Some(query) = services.sql_dialect.build_explain_sql(&content) else {
-                mark_explain_unavailable(state, services);
-                return Some(vec![]);
-            };
-            begin_explain_running(state, now);
-
-            Some(vec![Effect::ExecuteExplain {
-                dsn,
-                query,
-                is_analyze: false,
-                read_only: true,
-            }])
-        }
-
-        Action::ExplainAnalyzeRequest => {
-            if reject_unsupported_explain(state, services) {
-                return Some(vec![]);
-            }
-            let content = state.sql_modal.editor.content().trim().to_string();
-            if content.is_empty() {
-                return Some(vec![]);
-            }
-            let Some(dsn) = &state.session.dsn else {
-                return Some(vec![]);
-            };
-            let dsn = dsn.clone();
-            if matches!(state.sql_modal.status(), SqlModalStatus::Running) {
-                return Some(vec![]);
-            }
-            if is_multi_statement(&content) {
-                show_explain_error_on_plan(
-                    state,
-                    "EXPLAIN ANALYZE does not support multiple statements",
-                );
-                return Some(vec![]);
-            }
-            let kind = statement_classifier::classify(&content);
-            let risk = evaluate_sql_risk(&kind, &content);
-
-            let is_dml = !matches!(kind, StatementKind::Select | StatementKind::Transaction);
-
-            if state.session.read_only && is_dml {
-                show_explain_error_on_plan(
-                    state,
-                    "Read-only mode: EXPLAIN ANALYZE is blocked for DML statements.",
-                );
-                return Some(vec![]);
-            }
-
-            state.explain.confirm_scroll_offset = 0;
-
-            match risk.confirmation {
-                ConfirmationType::TableNameInput { target } => {
-                    state
-                        .sql_modal
-                        .begin_confirming_analyze_high(content, Some(target));
-                }
-                ConfirmationType::Immediate => {
-                    let Some(explain_query) =
-                        services.sql_dialect.build_explain_analyze_sql(&content)
-                    else {
-                        mark_explain_unavailable(state, services);
-                        return Some(vec![]);
-                    };
-                    begin_explain_running(state, now);
-                    return Some(vec![Effect::ExecuteExplain {
-                        dsn,
-                        query: explain_query,
-                        is_analyze: true,
-                        read_only: state.session.read_only,
-                    }]);
-                }
-            }
-
-            Some(vec![])
-        }
-
-        Action::ExplainAnalyzeConfirm => {
-            if reject_unsupported_explain(state, services) {
-                return Some(vec![]);
-            }
-            let query = match state.sql_modal.status() {
-                SqlModalStatus::ConfirmingAnalyzeHigh {
-                    query,
-                    input,
-                    target_name,
-                } => target_name
-                    .as_ref()
-                    .is_some_and(|name| input.content() == name)
-                    .then(|| query.clone()),
-                _ => None,
-            };
-            if let Some(query) = query
-                && let Some(dsn) = state.session.dsn.clone()
-            {
-                let Some(explain_query) = services.sql_dialect.build_explain_analyze_sql(&query)
-                else {
-                    mark_explain_unavailable(state, services);
-                    return Some(vec![]);
-                };
-                begin_explain_running(state, now);
-                return Some(vec![Effect::ExecuteExplain {
-                    dsn,
-                    query: explain_query,
-                    is_analyze: true,
-                    read_only: state.session.read_only,
-                }]);
-            }
-            Some(vec![])
-        }
-
-        Action::ExplainAnalyzeCancel => {
-            if matches!(
-                state.sql_modal.status(),
-                SqlModalStatus::ConfirmingAnalyzeHigh { .. }
-            ) {
-                state.sql_modal.cancel_confirmation();
-            }
-            Some(vec![])
-        }
-
-        Action::ExplainCompleted {
-            plan_text,
-            is_analyze,
-            execution_time_ms,
-        } => {
-            let query = state.sql_modal.editor.content().to_string();
-            finish_explain_success(
-                state,
-                plan_text.clone(),
-                *is_analyze,
-                *execution_time_ms,
-                &query,
-            );
-            Some(vec![])
-        }
-
-        Action::ExplainFailed(error) => {
-            finish_explain_error(state, error.user_message());
-            Some(vec![])
-        }
-
-        Action::Scroll {
-            target:
-                target @ (ScrollTarget::ExplainConfirm
-                | ScrollTarget::ExplainPlan
-                | ScrollTarget::ExplainCompare),
-            direction,
-            amount: ScrollAmount::Line,
-        } => {
-            let (offset, max) = match target {
-                ScrollTarget::ExplainConfirm => {
-                    // blank + title + blank + separator + blank + warning(2) + blank = 8
-                    const CONFIRM_HEADER_LINES: usize = 8;
-                    let content_lines =
-                        CONFIRM_HEADER_LINES + state.sql_modal.editor.content().lines().count();
-                    let modal_inner = ExplainContext::modal_inner_height(state.ui.terminal_height);
-                    (
-                        &mut state.explain.confirm_scroll_offset,
-                        content_lines.saturating_sub(modal_inner),
-                    )
-                }
-                ScrollTarget::ExplainPlan => {
-                    let modal_inner = ExplainContext::modal_inner_height(state.ui.terminal_height);
-                    let max = state.explain.line_count().saturating_sub(modal_inner);
-                    (&mut state.explain.scroll_offset, max)
-                }
-                ScrollTarget::ExplainCompare => {
-                    let max = state.explain.compare_max_scroll(state.ui.terminal_height);
-                    (&mut state.explain.compare_scroll_offset, max)
-                }
-                _ => unreachable!(),
-            };
-            *offset = direction.clamp_vertical_offset(*offset, max, 1);
-            Some(vec![])
-        }
-
-        Action::CompareEditQuery => {
-            if let Some(ref right) = state.explain.right {
-                let query = right.full_query.clone();
-                state.sql_modal.load_query_for_editing(query);
-            }
-            Some(vec![])
-        }
-
-        Action::SqlModalNextTab => {
-            let tab = services
-                .db_capabilities
-                .next_sql_modal_tab(state.sql_modal.active_tab());
-            state.sql_modal.set_active_tab(tab);
-            Some(vec![])
-        }
-
-        Action::SqlModalPrevTab => {
-            let tab = services
-                .db_capabilities
-                .prev_sql_modal_tab(state.sql_modal.active_tab());
-            state.sql_modal.set_active_tab(tab);
-            Some(vec![])
-        }
-
-        _ => None,
-    }
+) -> DispatchResult {
+    request::reduce_request(state, action, now, services)
+        .or_else(|| analyze::reduce_analyze(state, action, now, services))
+        .or_else(|| result::reduce_result(state, action, now))
+        .or_else(|| scroll::reduce_scroll(state, action, now))
+        .or_else(|| tabs::reduce_tabs(state, action, now, services))
 }
 
 #[cfg(test)]
-pub fn reduce_explain(state: &mut AppState, action: &Action, now: Instant) -> Option<Vec<Effect>> {
-    reduce_explain_with_services(state, action, now, &crate::services::AppServices::stub())
+fn reduce_explain_with_services(
+    state: &mut AppState,
+    action: &Action,
+    now: Instant,
+    services: &AppServices,
+) -> DispatchResult {
+    dispatch_explain(state, action, now, services)
+}
+
+#[cfg(test)]
+fn reduce_explain(state: &mut AppState, action: &Action, now: Instant) -> DispatchResult {
+    dispatch_explain(state, action, now, &crate::services::AppServices::stub())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::effect::Effect;
     use crate::model::shared::db_capabilities::DbCapabilities;
     use crate::model::shared::input_mode::InputMode;
     use crate::model::shared::inspector_tab::InspectorTab;
+    use crate::model::sql_editor::modal::{SqlModalStatus, SqlModalTab};
     use crate::services::AppServices;
-    use crate::update::action::ScrollDirection;
+    use crate::update::action::{ScrollAmount, ScrollDirection, ScrollTarget};
     use std::time::Instant;
 
     fn sql_modal_state() -> AppState {
@@ -334,8 +73,9 @@ mod tests {
             state.sql_modal.editor.set_content("  ".to_string());
             state.session.dsn = Some("dsn://test".to_string());
 
-            let effects =
-                reduce_explain(&mut state, &Action::ExplainRequest, Instant::now()).unwrap();
+            let effects = reduce_explain(&mut state, &Action::ExplainRequest, Instant::now())
+                .into_effects()
+                .expect("reducer should handle action");
 
             assert!(effects.is_empty());
         }
@@ -345,8 +85,9 @@ mod tests {
             let mut state = sql_modal_state();
             state.sql_modal.editor.set_content("SELECT 1".to_string());
 
-            let effects =
-                reduce_explain(&mut state, &Action::ExplainRequest, Instant::now()).unwrap();
+            let effects = reduce_explain(&mut state, &Action::ExplainRequest, Instant::now())
+                .into_effects()
+                .expect("reducer should handle action");
 
             assert!(effects.is_empty());
         }
@@ -358,8 +99,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
             state.sql_modal.set_status_for_test(SqlModalStatus::Running);
 
-            let effects =
-                reduce_explain(&mut state, &Action::ExplainRequest, Instant::now()).unwrap();
+            let effects = reduce_explain(&mut state, &Action::ExplainRequest, Instant::now())
+                .into_effects()
+                .expect("reducer should handle action");
 
             assert!(effects.is_empty());
         }
@@ -395,8 +137,9 @@ mod tests {
                 .set_content("SELECT 1; DELETE FROM users".to_string());
             state.session.dsn = Some("dsn://test".to_string());
 
-            let effects =
-                reduce_explain(&mut state, &Action::ExplainRequest, Instant::now()).unwrap();
+            let effects = reduce_explain(&mut state, &Action::ExplainRequest, Instant::now())
+                .into_effects()
+                .expect("reducer should handle action");
 
             assert!(effects.is_empty());
             assert_eq!(
@@ -424,8 +167,9 @@ mod tests {
             state.sql_modal.editor.set_content("SELECT 1".to_string());
             state.session.dsn = Some("dsn://test".to_string());
 
-            let effects =
-                reduce_explain(&mut state, &Action::ExplainRequest, Instant::now()).unwrap();
+            let effects = reduce_explain(&mut state, &Action::ExplainRequest, Instant::now())
+                .into_effects()
+                .expect("reducer should handle action");
 
             assert_eq!(effects.len(), 1);
             assert!(matches!(
@@ -451,7 +195,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert!(effects.is_empty());
         }
@@ -466,7 +212,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert!(effects.is_empty());
             assert_eq!(
@@ -506,7 +254,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert_eq!(effects.len(), 1);
             assert!(matches!(
@@ -529,7 +279,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert_eq!(*state.sql_modal.status(), SqlModalStatus::Running);
             assert_eq!(effects.len(), 1);
@@ -552,7 +304,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert_eq!(*state.sql_modal.status(), SqlModalStatus::Running);
             assert_eq!(effects.len(), 1);
@@ -595,7 +349,9 @@ mod tests {
             state.session.dsn = Some("dsn://test".to_string());
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert_eq!(*state.sql_modal.status(), SqlModalStatus::Running);
             assert_eq!(effects.len(), 1);
@@ -688,7 +444,9 @@ mod tests {
             state.session.read_only = true;
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeRequest, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert!(state.explain.error.is_none());
             assert_eq!(effects.len(), 1);
@@ -745,7 +503,9 @@ mod tests {
                 });
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeConfirm, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeConfirm, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert_eq!(effects.len(), 1);
             assert_eq!(*state.sql_modal.status(), SqlModalStatus::Running);
@@ -766,7 +526,9 @@ mod tests {
                 });
 
             let effects =
-                reduce_explain(&mut state, &Action::ExplainAnalyzeConfirm, Instant::now()).unwrap();
+                reduce_explain(&mut state, &Action::ExplainAnalyzeConfirm, Instant::now())
+                    .into_effects()
+                    .expect("reducer should handle action");
 
             assert!(effects.is_empty());
             assert!(matches!(
@@ -798,11 +560,16 @@ mod tests {
         #[test]
         fn sets_plan_and_switches_to_plan_tab() {
             let mut state = sql_modal_state();
+            state.session.dsn = Some("dsn://test".to_string());
+            let _ = state.query.begin_running(Instant::now());
             state.sql_modal.set_status_for_test(SqlModalStatus::Running);
 
             reduce_explain(
                 &mut state,
                 &Action::ExplainCompleted {
+                    dsn: "dsn://test".to_string(),
+                    run_id: 1,
+                    query: "SELECT 1".to_string(),
                     plan_text: "Seq Scan".to_string(),
                     is_analyze: false,
                     execution_time_ms: 42,
@@ -815,6 +582,37 @@ mod tests {
             assert_eq!(state.sql_modal.active_tab(), SqlModalTab::Plan);
             assert!(!state.query.is_running());
         }
+
+        #[test]
+        fn mismatched_dsn_does_not_replace_plan() {
+            let mut state = sql_modal_state();
+            state.session.dsn = Some("dsn://current".to_string());
+            let _ = state.query.begin_running(Instant::now());
+            state.sql_modal.set_status_for_test(SqlModalStatus::Running);
+            state
+                .explain
+                .set_plan("Original".to_string(), false, 10, "SELECT old");
+
+            reduce_explain(
+                &mut state,
+                &Action::ExplainCompleted {
+                    dsn: "dsn://stale".to_string(),
+                    run_id: 1,
+                    query: "SELECT stale".to_string(),
+                    plan_text: "Stale".to_string(),
+                    is_analyze: false,
+                    execution_time_ms: 42,
+                },
+                Instant::now(),
+            );
+
+            assert_eq!(state.explain.plan_text.as_deref(), Some("Original"));
+            assert_eq!(
+                state.explain.plan_query_snippet.as_deref(),
+                Some("SELECT old")
+            );
+            assert_eq!(*state.sql_modal.status(), SqlModalStatus::Running);
+        }
     }
 
     mod explain_failed {
@@ -824,11 +622,17 @@ mod tests {
         #[test]
         fn sets_error_and_switches_to_plan_tab() {
             let mut state = sql_modal_state();
+            state.session.dsn = Some("dsn://test".to_string());
+            let _ = state.query.begin_running(Instant::now());
             state.sql_modal.set_status_for_test(SqlModalStatus::Running);
 
             reduce_explain(
                 &mut state,
-                &Action::ExplainFailed(DbOperationError::QueryFailed("syntax error".to_string())),
+                &Action::ExplainFailed {
+                    dsn: "dsn://test".to_string(),
+                    run_id: 1,
+                    error: DbOperationError::QueryFailed("syntax error".to_string()),
+                },
                 Instant::now(),
             );
 
@@ -839,6 +643,31 @@ mod tests {
             assert_eq!(*state.sql_modal.status(), SqlModalStatus::Normal);
             assert_eq!(state.sql_modal.active_tab(), SqlModalTab::Plan);
             assert!(!state.query.is_running());
+        }
+
+        #[test]
+        fn mismatched_dsn_does_not_replace_plan_with_error() {
+            let mut state = sql_modal_state();
+            state.session.dsn = Some("dsn://current".to_string());
+            let _ = state.query.begin_running(Instant::now());
+            state.sql_modal.set_status_for_test(SqlModalStatus::Running);
+            state
+                .explain
+                .set_plan("Original".to_string(), false, 10, "SELECT old");
+
+            reduce_explain(
+                &mut state,
+                &Action::ExplainFailed {
+                    dsn: "dsn://stale".to_string(),
+                    run_id: 1,
+                    error: DbOperationError::QueryFailed("syntax error".to_string()),
+                },
+                Instant::now(),
+            );
+
+            assert_eq!(state.explain.plan_text.as_deref(), Some("Original"));
+            assert_eq!(state.explain.error, None);
+            assert_eq!(*state.sql_modal.status(), SqlModalStatus::Running);
         }
     }
 
@@ -857,6 +686,9 @@ mod tests {
             reduce_explain(
                 &mut state,
                 &Action::ExplainCompleted {
+                    dsn: "dsn://test".to_string(),
+                    run_id: 1,
+                    query: "SELECT 1".to_string(),
                     plan_text: "Seq Scan  (cost=0.00..100.00 rows=10 width=32)".to_string(),
                     is_analyze: false,
                     execution_time_ms: 42,
@@ -872,6 +704,9 @@ mod tests {
             reduce_explain(
                 &mut state,
                 &Action::ExplainCompleted {
+                    dsn: "dsn://test".to_string(),
+                    run_id: 2,
+                    query: "SELECT 2".to_string(),
                     plan_text: "Index Scan  (cost=0.00..5.00 rows=1 width=32)".to_string(),
                     is_analyze: false,
                     execution_time_ms: 5,

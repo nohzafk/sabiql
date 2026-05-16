@@ -5,28 +5,29 @@ use crate::model::app_state::AppState;
 use crate::model::shared::input_mode::InputMode;
 use crate::services::AppServices;
 use crate::update::action::{Action, ConnectionTarget};
+use crate::update::dispatch_result::DispatchResult;
 
 use super::helpers::{restore_cache, save_current_cache};
 
-pub fn reduce(
+pub(super) fn reduce_connection_lifecycle(
     state: &mut AppState,
     action: &Action,
     _now: Instant,
     services: &AppServices,
-) -> Option<Vec<Effect>> {
+) -> DispatchResult {
     match action {
         Action::TryConnect => {
             if state.session.connection_state().is_not_connected()
                 && state.modal.active_mode() == InputMode::Normal
             {
                 if let Some(dsn) = state.session.dsn.clone() {
-                    state.session.begin_connecting(&dsn);
-                    Some(vec![Effect::FetchMetadata { dsn }])
+                    let run_id = state.session.begin_connecting(&dsn);
+                    DispatchResult::handled_with(vec![Effect::FetchMetadata { dsn, run_id }])
                 } else {
-                    Some(vec![])
+                    DispatchResult::handled()
                 }
             } else {
-                Some(vec![])
+                DispatchResult::handled()
             }
         }
 
@@ -43,7 +44,7 @@ pub fn reduce(
                 state.session.dsn = Some(dsn.clone());
                 state.session.active_connection_name = Some(name.clone());
                 state.session.read_only = false;
-                Some(vec![Effect::ClearCompletionEngineCache])
+                DispatchResult::handled_with(vec![Effect::ClearCompletionEngineCache])
             } else {
                 // No cache: reset and fetch metadata
                 state.session.reset(&mut state.query);
@@ -52,15 +53,18 @@ pub fn reduce(
                 state.session.active_connection_id = Some(id.clone());
                 state.session.active_connection_name = Some(name.clone());
                 state.session.read_only = false;
-                state.session.begin_connecting(dsn);
-                Some(vec![
+                let run_id = state.session.begin_connecting(dsn);
+                DispatchResult::handled_with(vec![
                     Effect::ClearCompletionEngineCache,
-                    Effect::FetchMetadata { dsn: dsn.clone() },
+                    Effect::FetchMetadata {
+                        dsn: dsn.clone(),
+                        run_id,
+                    },
                 ])
             }
         }
 
-        _ => None,
+        _ => DispatchResult::pass(),
     }
 }
 
@@ -92,7 +96,7 @@ mod tests {
         state.ui.inspector_tab = InspectorTab::Indexes;
 
         let action = create_switch_action(&new_id, "new_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         let saved = state.connection_caches.get(&current_id).unwrap();
         assert_eq!(saved.explorer_selected, 5);
@@ -113,7 +117,7 @@ mod tests {
         state.connection_caches.save(&target_id, cached);
 
         let action = create_switch_action(&target_id, "cached_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert_eq!(state.ui.explorer_selected, 42);
         assert_eq!(state.ui.inspector_tab, InspectorTab::ForeignKeys);
@@ -137,7 +141,7 @@ mod tests {
         state.connection_caches.save(&target_id, cached);
 
         let action = create_switch_action(&target_id, "cached_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert_eq!(state.ui.inspector_tab, InspectorTab::Info);
     }
@@ -149,7 +153,9 @@ mod tests {
         let services = AppServices::stub();
 
         let action = create_switch_action(&new_id, "fresh_db");
-        let effects = reduce(&mut state, &action, Instant::now(), &services).unwrap();
+        let effects = reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services)
+            .into_effects()
+            .expect("reducer should handle action");
 
         assert!(
             effects
@@ -169,7 +175,7 @@ mod tests {
         let services = AppServices::stub();
 
         let action = create_switch_action(&new_id, "target_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert_eq!(state.session.active_connection_id, Some(new_id));
         assert_eq!(
@@ -193,7 +199,7 @@ mod tests {
             .save(&target_id, ConnectionCache::default());
 
         let action = create_switch_action(&target_id, "cached_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert_eq!(state.session.connection_state(), ConnectionState::Connected);
     }
@@ -210,7 +216,7 @@ mod tests {
         state.result_interaction.activate_cell(3, 2);
 
         let action = create_switch_action(&target_id, "cached_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert_eq!(
             state.result_interaction.selection().mode(),
@@ -227,7 +233,7 @@ mod tests {
         state.result_interaction.activate_cell(5, 0);
 
         let action = create_switch_action(&new_id, "fresh_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert_eq!(
             state.result_interaction.selection().mode(),
@@ -243,7 +249,7 @@ mod tests {
         state.session.read_only = true;
 
         let action = create_switch_action(&new_id, "fresh_db");
-        reduce(&mut state, &action, Instant::now(), &services);
+        reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services);
 
         assert!(!state.session.read_only);
     }
@@ -255,7 +261,9 @@ mod tests {
         let services = AppServices::stub();
 
         let action = create_switch_action(&new_id, "any_db");
-        let effects = reduce(&mut state, &action, Instant::now(), &services).unwrap();
+        let effects = reduce_connection_lifecycle(&mut state, &action, Instant::now(), &services)
+            .into_effects()
+            .expect("reducer should handle action");
 
         assert!(
             effects

@@ -15,6 +15,7 @@ use crate::policy::write::write_update::{
 };
 use crate::services::AppServices;
 use crate::update::action::Action;
+use crate::update::dispatch_result::DispatchResult;
 use crate::update::helpers::{
     EditGuardrailError, build_bulk_delete_preview, editable_preview_base,
 };
@@ -138,7 +139,7 @@ pub fn reduce(
     action: &Action,
     now: Instant,
     services: &AppServices,
-) -> Option<Vec<Effect>> {
+) -> DispatchResult {
     match action {
         Action::SubmitCellEditWrite => {
             if !state.result_interaction.staged_delete_rows().is_empty() {
@@ -150,13 +151,13 @@ pub fn reduce(
                             result.target_row,
                             staged_count,
                         );
-                        return Some(vec![Effect::DispatchActions(vec![
+                        return DispatchResult::handled_with(vec![Effect::DispatchActions(vec![
                             Action::OpenWritePreviewConfirm(Box::new(result.preview)),
                         ])]);
                     }
                     Err(err) => {
                         state.messages.set_error_at(err.to_string(), now);
-                        return Some(vec![]);
+                        return DispatchResult::handled();
                     }
                 }
             }
@@ -166,16 +167,16 @@ pub fn reduce(
                     EditGuardrailError::WriteUnavailableWhileQueryRunning.to_string(),
                     now,
                 );
-                return Some(vec![]);
+                return DispatchResult::handled();
             }
 
             match build_update_preview(state, services) {
-                Ok(preview) => Some(vec![Effect::DispatchActions(vec![
+                Ok(preview) => DispatchResult::handled_with(vec![Effect::DispatchActions(vec![
                     Action::OpenWritePreviewConfirm(Box::new(preview)),
                 ])]),
                 Err(err) => {
                     state.messages.set_error_at(err.to_string(), now);
-                    Some(vec![])
+                    DispatchResult::handled()
                 }
             }
         }
@@ -186,7 +187,7 @@ pub fn reduce(
                     "Read-only mode: write operations are disabled".to_string(),
                     now,
                 );
-                return Some(vec![]);
+                return DispatchResult::handled();
             }
             state
                 .result_interaction
@@ -224,7 +225,7 @@ pub fn reduce(
             }
             state.modal.push_mode(InputMode::ConfirmDialog);
 
-            Some(vec![])
+            DispatchResult::handled()
         }
 
         Action::ExecuteWrite(query) => {
@@ -233,12 +234,13 @@ pub fn reduce(
                     "Read-only mode: write operations are disabled".to_string(),
                     now,
                 );
-                return Some(vec![]);
+                return DispatchResult::handled();
             }
             if let Some(dsn) = &state.session.dsn {
-                state.query.begin_running(now);
-                Some(vec![Effect::ExecuteWrite {
+                let run_id = state.query.begin_running(now);
+                DispatchResult::handled_with(vec![Effect::ExecuteWrite {
                     dsn: dsn.clone(),
+                    run_id,
                     query: query.clone(),
                     read_only: state.session.read_only,
                 }])
@@ -246,11 +248,19 @@ pub fn reduce(
                 state
                     .messages
                     .set_error_at("No active connection".to_string(), now);
-                Some(vec![])
+                DispatchResult::handled()
             }
         }
 
-        Action::ExecuteWriteSucceeded { affected_rows } => {
+        Action::ExecuteWriteSucceeded {
+            dsn,
+            run_id,
+            affected_rows,
+        } => {
+            if state.session.dsn.as_ref() != Some(dsn) || !state.query.is_current_run(*run_id) {
+                return DispatchResult::handled();
+            }
+
             state.query.mark_idle();
             let operation = state
                 .result_interaction
@@ -265,7 +275,7 @@ pub fn reduce(
                             now,
                         );
                         state.modal.set_mode(InputMode::CellEdit);
-                        return Some(vec![]);
+                        return DispatchResult::handled();
                     }
 
                     state
@@ -276,19 +286,20 @@ pub fn reduce(
 
                     if let Some(dsn) = &state.session.dsn {
                         let page = state.query.pagination.current_page;
-                        state.query.begin_running(now);
-                        Some(vec![Effect::ExecutePreview {
+                        let run_id = state.query.begin_running(now);
+                        DispatchResult::handled_with(vec![Effect::ExecutePreview {
                             dsn: dsn.clone(),
                             schema: state.query.pagination.schema.clone(),
                             table: state.query.pagination.table.clone(),
                             generation: state.session.selection_generation(),
+                            run_id,
                             limit: PREVIEW_PAGE_SIZE,
                             offset: page * PREVIEW_PAGE_SIZE,
                             target_page: page,
                             read_only: state.session.read_only,
                         }])
                     } else {
-                        Some(vec![])
+                        DispatchResult::handled()
                     }
                 }
                 WriteOperation::Delete => {
@@ -333,26 +344,31 @@ pub fn reduce(
                     ));
 
                     if let Some(dsn) = &state.session.dsn {
-                        state.query.begin_running(now);
+                        let run_id = state.query.begin_running(now);
                         state.query.pagination.reached_end = false;
-                        Some(vec![Effect::ExecutePreview {
+                        DispatchResult::handled_with(vec![Effect::ExecutePreview {
                             dsn: dsn.clone(),
                             schema: state.query.pagination.schema.clone(),
                             table: state.query.pagination.table.clone(),
                             generation: state.session.selection_generation(),
+                            run_id,
                             limit: PREVIEW_PAGE_SIZE,
                             offset: target_page * PREVIEW_PAGE_SIZE,
                             target_page,
                             read_only: state.session.read_only,
                         }])
                     } else {
-                        Some(vec![])
+                        DispatchResult::handled()
                     }
                 }
             }
         }
 
-        Action::ExecuteWriteFailed(error) => {
+        Action::ExecuteWriteFailed { dsn, run_id, error } => {
+            if state.session.dsn.as_ref() != Some(dsn) || !state.query.is_current_run(*run_id) {
+                return DispatchResult::handled();
+            }
+
             state.query.mark_idle();
             let operation = state
                 .result_interaction
@@ -365,24 +381,66 @@ pub fn reduce(
                 WriteOperation::Update => InputMode::CellEdit,
                 WriteOperation::Delete => InputMode::Normal,
             });
-            Some(vec![])
+            DispatchResult::handled()
         }
 
-        _ => None,
+        _ => DispatchResult::pass(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::domain::QueryResult;
     use crate::model::browse::query_execution::{
         DeleteRefreshTarget, PostDeleteRowSelection, QueryStatus,
     };
     use crate::policy::write::write_guardrails::{
         GuardrailDecision, RiskLevel, TargetSummary, WriteOperation, WritePreview,
     };
+    use crate::ports::outbound::DbOperationError;
     use crate::update::browse::query::reduce_query;
     use crate::update::browse::query::tests::*;
+
+    fn begin_query_run(state: &mut AppState) -> u64 {
+        state.query.begin_running(Instant::now())
+    }
+
+    fn write_succeeded_action(state: &mut AppState, affected_rows: usize) -> Action {
+        let run_id = begin_query_run(state);
+        Action::ExecuteWriteSucceeded {
+            dsn: "postgres://localhost/test".to_string(),
+            run_id,
+            affected_rows,
+        }
+    }
+
+    fn write_failed_action(state: &mut AppState, error: DbOperationError) -> Action {
+        let run_id = begin_query_run(state);
+        Action::ExecuteWriteFailed {
+            dsn: "postgres://localhost/test".to_string(),
+            run_id,
+            error,
+        }
+    }
+
+    fn query_completed_action(
+        state: &mut AppState,
+        result: Arc<QueryResult>,
+        generation: u64,
+        target_page: Option<usize>,
+    ) -> Action {
+        let run_id = begin_query_run(state);
+        Action::QueryCompleted {
+            dsn: "postgres://localhost/test".to_string(),
+            run_id,
+            result,
+            generation,
+            target_page,
+        }
+    }
 
     mod write_flow {
         use super::*;
@@ -418,7 +476,12 @@ mod tests {
                 Instant::now(),
                 &AppServices::stub(),
             );
-            assert!(effects.unwrap().is_empty());
+            assert!(
+                effects
+                    .into_effects()
+                    .expect("reducer should handle action")
+                    .is_empty()
+            );
             assert_eq!(
                 state.messages.last_error.as_deref(),
                 Some("No active cell edit session")
@@ -428,7 +491,7 @@ mod tests {
         #[test]
         fn write_requires_idle_query_status() {
             let mut state = editable_state();
-            state.query.begin_running(Instant::now());
+            let _ = state.query.begin_running(Instant::now());
 
             let effects = reduce_query(
                 &mut state,
@@ -436,7 +499,12 @@ mod tests {
                 Instant::now(),
                 &AppServices::stub(),
             );
-            assert!(effects.unwrap().is_empty());
+            assert!(
+                effects
+                    .into_effects()
+                    .expect("reducer should handle action")
+                    .is_empty()
+            );
             assert_eq!(
                 state.messages.last_error.as_deref(),
                 Some("Write is unavailable while query is running")
@@ -457,7 +525,12 @@ mod tests {
                 Instant::now(),
                 &AppServices::stub(),
             );
-            assert!(effects.unwrap().is_empty());
+            assert!(
+                effects
+                    .into_effects()
+                    .expect("reducer should handle action")
+                    .is_empty()
+            );
             assert_eq!(
                 state.messages.last_error.as_deref(),
                 Some("Table metadata does not match current preview target")
@@ -620,14 +693,10 @@ mod tests {
         fn execute_write_success_refreshes_preview_page() {
             let mut state = editable_state();
             state.query.pagination.current_page = 2;
+            let action = write_succeeded_action(&mut state, 1);
 
-            let effects = reduce_query(
-                &mut state,
-                &Action::ExecuteWriteSucceeded { affected_rows: 1 },
-                Instant::now(),
-                &AppServices::stub(),
-            )
-            .unwrap();
+            let effects =
+                reduce_query(&mut state, &action, Instant::now(), &AppServices::stub()).unwrap();
 
             assert_eq!(state.input_mode(), InputMode::Normal);
             assert_eq!(state.query.status(), QueryStatus::Running);
@@ -649,14 +718,10 @@ mod tests {
         #[test]
         fn execute_write_with_non_one_row_sets_error() {
             let mut state = editable_state();
+            let action = write_succeeded_action(&mut state, 0);
 
-            let effects = reduce_query(
-                &mut state,
-                &Action::ExecuteWriteSucceeded { affected_rows: 0 },
-                Instant::now(),
-                &AppServices::stub(),
-            )
-            .unwrap();
+            let effects =
+                reduce_query(&mut state, &action, Instant::now(), &AppServices::stub()).unwrap();
 
             assert!(effects.is_empty());
             assert_eq!(state.input_mode(), InputMode::CellEdit);
@@ -664,6 +729,29 @@ mod tests {
                 state.messages.last_error.as_deref(),
                 Some("UPDATE expected 1 row, but affected 0 rows")
             );
+        }
+
+        #[test]
+        fn stale_write_success_does_not_refresh_or_set_message() {
+            let mut state = editable_state();
+            let old_run_id = begin_query_run(&mut state);
+            let _ = begin_query_run(&mut state);
+
+            let effects = reduce_query(
+                &mut state,
+                &Action::ExecuteWriteSucceeded {
+                    dsn: "postgres://localhost/test".to_string(),
+                    run_id: old_run_id,
+                    affected_rows: 1,
+                },
+                Instant::now(),
+                &AppServices::stub(),
+            )
+            .unwrap();
+
+            assert!(effects.is_empty());
+            assert!(state.messages.last_success.is_none());
+            assert!(state.query.is_running());
         }
     }
 
@@ -750,14 +838,10 @@ mod tests {
             state.query.pagination.table = "users".to_string();
             state.query.set_delete_refresh_target(1, Some(499), 1);
             state.result_interaction.set_write_preview(delete_preview());
+            let action = write_succeeded_action(&mut state, 1);
 
-            let effects = reduce_query(
-                &mut state,
-                &Action::ExecuteWriteSucceeded { affected_rows: 1 },
-                Instant::now(),
-                &AppServices::stub(),
-            )
-            .unwrap();
+            let effects =
+                reduce_query(&mut state, &action, Instant::now(), &AppServices::stub()).unwrap();
 
             assert_eq!(state.input_mode(), InputMode::Normal);
             assert_eq!(
@@ -788,14 +872,10 @@ mod tests {
             state.query.pagination.schema = "public".to_string();
             state.query.pagination.table = "users".to_string();
             state.result_interaction.set_write_preview(delete_preview());
+            let action = write_succeeded_action(&mut state, 0);
 
-            let effects = reduce_query(
-                &mut state,
-                &Action::ExecuteWriteSucceeded { affected_rows: 0 },
-                Instant::now(),
-                &AppServices::stub(),
-            )
-            .unwrap();
+            let effects =
+                reduce_query(&mut state, &action, Instant::now(), &AppServices::stub()).unwrap();
 
             assert_eq!(state.input_mode(), InputMode::Normal);
             assert_eq!(
@@ -809,14 +889,13 @@ mod tests {
         fn execute_write_failed_for_delete_returns_to_normal_mode() {
             let mut state = create_test_state();
             state.result_interaction.set_write_preview(delete_preview());
-
-            let effects = reduce_query(
+            let action = write_failed_action(
                 &mut state,
-                &Action::ExecuteWriteFailed(DbOperationError::QueryFailed("boom".to_string())),
-                Instant::now(),
-                &AppServices::stub(),
-            )
-            .unwrap();
+                DbOperationError::QueryFailed("boom".to_string()),
+            );
+
+            let effects =
+                reduce_query(&mut state, &action, Instant::now(), &AppServices::stub()).unwrap();
 
             assert!(effects.is_empty());
             assert_eq!(state.input_mode(), InputMode::Normal);
@@ -833,17 +912,9 @@ mod tests {
             state
                 .query
                 .set_post_delete_selection(PostDeleteRowSelection::Select(1000));
+            let action = query_completed_action(&mut state, preview_result(3), 1, Some(0));
 
-            reduce_query(
-                &mut state,
-                &Action::QueryCompleted {
-                    result: preview_result(3),
-                    generation: 1,
-                    target_page: Some(0),
-                },
-                Instant::now(),
-                &AppServices::stub(),
-            );
+            reduce_query(&mut state, &action, Instant::now(), &AppServices::stub());
 
             assert_eq!(state.result_interaction.selection().row(), Some(2));
             assert_eq!(
@@ -860,17 +931,9 @@ mod tests {
             state
                 .query
                 .set_post_delete_selection(PostDeleteRowSelection::Clear);
+            let action = query_completed_action(&mut state, preview_result(2), 1, Some(0));
 
-            reduce_query(
-                &mut state,
-                &Action::QueryCompleted {
-                    result: preview_result(2),
-                    generation: 1,
-                    target_page: Some(0),
-                },
-                Instant::now(),
-                &AppServices::stub(),
-            );
+            reduce_query(&mut state, &action, Instant::now(), &AppServices::stub());
 
             assert_eq!(state.result_interaction.selection().row(), None);
             assert_eq!(
