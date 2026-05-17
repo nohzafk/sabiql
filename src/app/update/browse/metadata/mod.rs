@@ -1,21 +1,17 @@
-use std::sync::Arc;
 use std::time::Instant;
+
+mod er_neighbors;
+mod loading;
+mod prefetch;
+mod table_detail;
 
 use crate::cmd::effect::Effect;
 use crate::model::app_state::AppState;
-use crate::model::browse::query_execution::PREVIEW_PAGE_SIZE;
-use crate::model::connection::error::ConnectionErrorInfo;
 use crate::model::er_state::ErStatus;
-use crate::model::shared::input_mode::InputMode;
-use crate::model::sql_editor::modal::FailedPrefetchEntry;
-use crate::update::action::{Action, ModalKind, TableTarget};
+use crate::update::action::Action;
 use crate::update::dispatch_result::DispatchResult;
 
-const BASE_BACKOFF_SECS: u64 = 1;
-const MAX_BACKOFF_SECS: u64 = 4;
-const MAX_PREFETCH_RETRIES: u32 = 3;
-
-fn check_er_completion(state: &mut AppState) -> Vec<Effect> {
+pub(super) fn check_er_completion(state: &mut AppState) -> Vec<Effect> {
     if state.er_preparation.status != ErStatus::Waiting || !state.er_preparation.is_complete() {
         return vec![];
     }
@@ -47,501 +43,21 @@ fn check_er_completion(state: &mut AppState) -> Vec<Effect> {
     }]
 }
 
-pub fn reduce_metadata(state: &mut AppState, action: &Action, now: Instant) -> DispatchResult {
-    match action {
-        Action::MetadataLoaded {
-            dsn,
-            run_id,
-            metadata,
-        } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.session.is_current_metadata_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-
-            let has_tables = !metadata.table_summaries.is_empty();
-            state.session.mark_connected(Arc::clone(metadata));
-
-            let mut effects = vec![];
-
-            if state.query.pagination.table.is_empty() {
-                state
-                    .ui
-                    .set_explorer_selection(if has_tables { Some(0) } else { None });
-            } else {
-                let prev_schema = &state.query.pagination.schema;
-                let prev_table = &state.query.pagination.table;
-                let found_index = metadata
-                    .table_summaries
-                    .iter()
-                    .position(|t| &t.schema == prev_schema && &t.name == prev_table);
-                if let Some(idx) = found_index {
-                    state.ui.set_explorer_selection(Some(idx));
-                    // Refresh preview and detail: DDL or reload may have changed
-                    // data/schema even though the table still exists.
-                    let dsn = dsn.clone();
-                    let page = state.query.pagination.current_page;
-                    let generation = state.session.selection_generation();
-                    let query_run_id = state.query.begin_running(now);
-                    let detail_run_id = state.session.begin_table_detail_run();
-                    effects.push(Effect::ExecutePreview {
-                        dsn: dsn.clone(),
-                        schema: state.query.pagination.schema.clone(),
-                        table: state.query.pagination.table.clone(),
-                        generation,
-                        run_id: query_run_id,
-                        limit: PREVIEW_PAGE_SIZE,
-                        offset: page * PREVIEW_PAGE_SIZE,
-                        target_page: page,
-                        read_only: state.session.read_only,
-                    });
-                    effects.push(Effect::FetchTableDetail {
-                        dsn,
-                        schema: state.query.pagination.schema.clone(),
-                        table: state.query.pagination.table.clone(),
-                        generation,
-                        run_id: detail_run_id,
-                    });
-                } else {
-                    // The previously selected table was removed (e.g. via DROP TABLE).
-                    // Clear all selection state to avoid stale references.
-                    state
-                        .ui
-                        .set_explorer_selection(if has_tables { Some(0) } else { None });
-                    state
-                        .session
-                        .clear_table_selection(&mut state.query.pagination);
-                    state.query.clear_current_result();
-                }
-            }
-
-            state.connection_error.clear();
-
-            if state.session.is_reloading {
-                state.messages.set_success_at("Reloaded!".to_string(), now);
-                state.session.is_reloading = false;
-            }
-
-            if state.modal.active_mode() == InputMode::SqlModal
-                && !state.sql_modal.is_prefetch_started()
-            {
-                effects.push(Effect::DispatchActions(vec![Action::StartPrefetchAll]));
-            }
-
-            if state.ui.pending_er_picker && state.modal.active_mode() == InputMode::Normal {
-                state.ui.pending_er_picker = false;
-                effects.push(Effect::DispatchActions(vec![Action::OpenModal(
-                    ModalKind::ErTablePicker,
-                )]));
-            } else {
-                state.ui.pending_er_picker = false;
-            }
-
-            DispatchResult::handled_with(effects)
-        }
-        Action::MetadataFailed { dsn, run_id, error } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.session.is_current_metadata_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-
-            let error_info = ConnectionErrorInfo::from_db_operation_error(error);
-            state.connection_error.set_error(error_info);
-            let was_connected = state.session.connection_state().is_connected();
-            state.session.mark_connection_failed(error.masked_details());
-            if !was_connected {
-                state.modal.replace_mode(InputMode::ConnectionError);
-            }
-            if state.er_preparation.status == ErStatus::Waiting {
-                state.er_preparation.status = ErStatus::Idle;
-            }
-            DispatchResult::handled()
-        }
-        Action::TableDetailLoaded {
-            dsn,
-            run_id,
-            detail,
-            generation,
-        } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.session.is_current_table_detail_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-
-            if state.session.set_table_detail(*detail.clone(), *generation) {
-                state.ui.inspector_scroll_offset = 0;
-            }
-            DispatchResult::handled()
-        }
-        Action::TableDetailFailed {
-            dsn,
-            run_id,
-            error,
-            generation,
-        } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.session.is_current_table_detail_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-
-            if *generation == state.session.selection_generation() {
-                state.set_error(error.user_message());
-            }
-            DispatchResult::handled()
-        }
-
-        Action::LoadMetadata => {
-            if let Some(dsn) = state.session.dsn.clone() {
-                let run_id = state.session.begin_metadata_refresh();
-                DispatchResult::handled_with(vec![Effect::FetchMetadata { dsn, run_id }])
-            } else {
-                DispatchResult::handled()
-            }
-        }
-        Action::LoadTableDetail(TableTarget {
-            schema,
-            table,
-            generation,
-        }) => {
-            if let Some(dsn) = state.session.dsn.clone() {
-                let run_id = state.session.begin_table_detail_run();
-                DispatchResult::handled_with(vec![Effect::FetchTableDetail {
-                    dsn,
-                    schema: schema.clone(),
-                    table: table.clone(),
-                    generation: *generation,
-                    run_id,
-                }])
-            } else {
-                DispatchResult::handled()
-            }
-        }
-
-        Action::ReloadMetadata => {
-            if let Some(dsn) = state.session.dsn.clone() {
-                let run_id = state.session.begin_reload();
-                state.sql_modal.reset_prefetch();
-                state.er_preparation.reset();
-                state.ui.er_selected_tables.clear();
-                state.ui.pending_er_picker = false;
-                state.messages.last_error = None;
-                state.messages.last_success = None;
-                state.messages.expires_at = None;
-
-                DispatchResult::handled_with(vec![Effect::Sequence(vec![
-                    Effect::CacheInvalidate { dsn: dsn.clone() },
-                    Effect::ClearCompletionEngineCache,
-                    Effect::FetchMetadata { dsn, run_id },
-                ])])
-            } else {
-                DispatchResult::handled()
-            }
-        }
-
-        Action::StartPrefetchAll => {
-            if !state.sql_modal.is_prefetch_started()
-                && let Some(metadata) = state.session.metadata()
-            {
-                let run_id = state.sql_modal.begin_prefetch();
-                state.er_preparation.pending_tables.clear();
-                state.er_preparation.fetching_tables.clear();
-                state.er_preparation.failed_tables.clear();
-                state.er_preparation.total_tables = metadata.table_summaries.len();
-                state.er_preparation.fk_expanded = true;
-
-                let table_count = metadata.table_summaries.len();
-                let resize_capacity = table_count.clamp(500, 10_000);
-
-                for table_summary in &metadata.table_summaries {
-                    let qualified_name = table_summary.qualified_name();
-                    state
-                        .sql_modal
-                        .prefetch_queue
-                        .push_back(qualified_name.clone());
-                    state.er_preparation.pending_tables.insert(qualified_name);
-                }
-                DispatchResult::handled_with(vec![
-                    Effect::ResizeCompletionCache {
-                        capacity: resize_capacity,
-                    },
-                    Effect::ProcessPrefetchQueue { run_id },
-                ])
-            } else {
-                DispatchResult::handled()
-            }
-        }
-
-        Action::StartPrefetchScoped { tables } => {
-            if state.sql_modal.is_prefetch_started() {
-                DispatchResult::handled()
-            } else {
-                let run_id = state.sql_modal.begin_prefetch();
-                state.er_preparation.pending_tables.clear();
-                state.er_preparation.fetching_tables.clear();
-                state.er_preparation.failed_tables.clear();
-                state.er_preparation.fk_expanded = false;
-                state.er_preparation.seed_tables.clone_from(tables);
-                state.er_preparation.total_tables = tables.len();
-
-                for qualified_name in tables {
-                    state
-                        .sql_modal
-                        .prefetch_queue
-                        .push_back(qualified_name.clone());
-                    state
-                        .er_preparation
-                        .pending_tables
-                        .insert(qualified_name.clone());
-                }
-                DispatchResult::handled_with(vec![Effect::ProcessPrefetchQueue { run_id }])
-            }
-        }
-
-        Action::ExpandPrefetchWithFkNeighbors => {
-            let seed_tables = state.er_preparation.seed_tables.clone();
-            DispatchResult::handled_with(vec![Effect::ExtractFkNeighbors { seed_tables }])
-        }
-
-        Action::FkNeighborsDiscovered { tables } => {
-            state.er_preparation.fk_expanded = true;
-
-            if tables.is_empty() {
-                // No new neighbors — proceed to generate with what we have
-                return DispatchResult::handled_with(check_er_completion(state));
-            }
-
-            for qualified_name in tables {
-                state
-                    .er_preparation
-                    .pending_tables
-                    .insert(qualified_name.clone());
-                state
-                    .sql_modal
-                    .prefetch_queue
-                    .push_back(qualified_name.clone());
-            }
-            let Some(run_id) = state.sql_modal.active_prefetch_run_id() else {
-                return DispatchResult::handled();
-            };
-            DispatchResult::handled_with(vec![Effect::ProcessPrefetchQueue { run_id }])
-        }
-
-        Action::ProcessPrefetchQueue { run_id } => {
-            if !state.sql_modal.is_current_prefetch_run(*run_id) {
-                return DispatchResult::handled();
-            }
-            const MAX_CONCURRENT_PREFETCH: usize = 4;
-            let current_in_flight = state.sql_modal.prefetching_tables.len();
-            let available_slots = MAX_CONCURRENT_PREFETCH.saturating_sub(current_in_flight);
-
-            let mut actions = Vec::new();
-            for _ in 0..available_slots {
-                if let Some(qualified_name) = state.sql_modal.prefetch_queue.pop_front()
-                    && let Some((schema, table)) = qualified_name.split_once('.')
-                {
-                    actions.push(Action::PrefetchTableDetail {
-                        run_id: *run_id,
-                        schema: schema.to_string(),
-                        table: table.to_string(),
-                    });
-                }
-            }
-
-            if actions.is_empty() {
-                DispatchResult::handled()
-            } else {
-                DispatchResult::handled_with(vec![Effect::DispatchActions(actions)])
-            }
-        }
-
-        Action::PrefetchTableDetail {
-            run_id,
-            schema,
-            table,
-        } => {
-            if !state.sql_modal.is_current_prefetch_run(*run_id) {
-                return DispatchResult::handled();
-            }
-            let qualified_name = format!("{schema}.{table}");
-
-            if state.sql_modal.prefetching_tables.contains(&qualified_name) {
-                return DispatchResult::handled();
-            }
-
-            if let Some(entry) = state.sql_modal.failed_prefetch_tables.get(&qualified_name) {
-                if entry.retry_count >= MAX_PREFETCH_RETRIES {
-                    // Exceeded retry limit — give up, don't re-queue
-                    state.er_preparation.pending_tables.remove(&qualified_name);
-                    state
-                        .er_preparation
-                        .on_table_failed(&qualified_name, entry.error.clone());
-                    let mut effects = check_er_completion(state);
-                    // No fetch started → no completion event to re-drive the queue.
-                    if effects.is_empty() && state.er_preparation.status == ErStatus::Waiting {
-                        effects.push(Effect::ProcessPrefetchQueue { run_id: *run_id });
-                    }
-                    return DispatchResult::handled_with(effects);
-                }
-
-                let backoff_secs =
-                    (BASE_BACKOFF_SECS * 2u64.pow(entry.retry_count)).min(MAX_BACKOFF_SECS);
-                let elapsed = entry.failed_at.elapsed().as_secs();
-                if elapsed < backoff_secs {
-                    // Still in backoff — re-queue at tail and schedule a delayed retry
-                    // to avoid busy-looping while waiting for the backoff to expire.
-                    let remaining = backoff_secs - elapsed;
-                    state.sql_modal.prefetch_queue.push_back(qualified_name);
-                    return DispatchResult::handled_with(vec![
-                        Effect::DelayedProcessPrefetchQueue {
-                            run_id: *run_id,
-                            delay_secs: remaining,
-                        },
-                    ]);
-                }
-            }
-
-            state
-                .sql_modal
-                .prefetching_tables
-                .insert(qualified_name.clone());
-            state.er_preparation.pending_tables.remove(&qualified_name);
-            state
-                .er_preparation
-                .fetching_tables
-                .insert(qualified_name.clone());
-
-            if let Some(dsn) = &state.session.dsn {
-                DispatchResult::handled_with(vec![Effect::PrefetchTableDetail {
-                    dsn: dsn.clone(),
-                    run_id: *run_id,
-                    schema: schema.clone(),
-                    table: table.clone(),
-                }])
-            } else {
-                DispatchResult::handled()
-            }
-        }
-
-        Action::TableDetailCached {
-            dsn,
-            run_id,
-            schema,
-            table,
-            detail,
-        } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.sql_modal.is_current_prefetch_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-            let qualified_name = format!("{schema}.{table}");
-            state.sql_modal.prefetching_tables.remove(&qualified_name);
-            state
-                .sql_modal
-                .failed_prefetch_tables
-                .remove(&qualified_name);
-            state.er_preparation.on_table_cached(&qualified_name);
-
-            let mut effects = vec![Effect::CacheTableInCompletionEngine {
-                qualified_name,
-                table: detail.clone(),
-            }];
-
-            if !state.sql_modal.prefetch_queue.is_empty() {
-                effects.push(Effect::ProcessPrefetchQueue { run_id: *run_id });
-            }
-
-            effects.extend(check_er_completion(state));
-
-            DispatchResult::handled_with(effects)
-        }
-
-        Action::TableDetailCacheFailed {
-            dsn,
-            run_id,
-            schema,
-            table,
-            error,
-        } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.sql_modal.is_current_prefetch_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-            let qualified_name = format!("{schema}.{table}");
-            state.sql_modal.prefetching_tables.remove(&qualified_name);
-
-            let prev_count = state
-                .sql_modal
-                .failed_prefetch_tables
-                .get(&qualified_name)
-                .map_or(0, |e| e.retry_count);
-            state.sql_modal.failed_prefetch_tables.insert(
-                qualified_name.clone(),
-                FailedPrefetchEntry {
-                    failed_at: now,
-                    error: error.user_message(),
-                    retry_count: prev_count + 1,
-                },
-            );
-            state
-                .er_preparation
-                .on_table_failed(&qualified_name, error.user_message());
-
-            let mut effects = Vec::new();
-
-            if !state.sql_modal.prefetch_queue.is_empty() {
-                effects.push(Effect::ProcessPrefetchQueue { run_id: *run_id });
-            }
-
-            effects.extend(check_er_completion(state));
-
-            DispatchResult::handled_with(effects)
-        }
-
-        Action::TableDetailAlreadyCached {
-            dsn,
-            run_id,
-            schema,
-            table,
-        } => {
-            if state.session.dsn.as_ref() != Some(dsn)
-                || !state.sql_modal.is_current_prefetch_run(*run_id)
-            {
-                return DispatchResult::handled();
-            }
-            let qualified_name = format!("{schema}.{table}");
-            state.sql_modal.prefetching_tables.remove(&qualified_name);
-            state
-                .sql_modal
-                .failed_prefetch_tables
-                .remove(&qualified_name);
-            state.er_preparation.on_table_cached(&qualified_name);
-
-            let mut effects = Vec::new();
-
-            if !state.sql_modal.prefetch_queue.is_empty() {
-                effects.push(Effect::ProcessPrefetchQueue { run_id: *run_id });
-            }
-
-            effects.extend(check_er_completion(state));
-
-            DispatchResult::handled_with(effects)
-        }
-
-        _ => DispatchResult::pass(),
-    }
+pub fn dispatch_metadata(state: &mut AppState, action: &Action, now: Instant) -> DispatchResult {
+    loading::reduce_loading(state, action, now)
+        .or_else(|| table_detail::reduce_table_detail(state, action))
+        .or_else(|| prefetch::reduce_prefetch(state, action, now))
+        .or_else(|| er_neighbors::reduce_er_neighbors(state, action))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::effect::Effect;
     use crate::model::app_state::AppState;
     use crate::model::sql_editor::modal::FailedPrefetchEntry;
+    use crate::update::action::Action;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn state_with_dsn(dsn: &str) -> AppState {
@@ -589,7 +105,7 @@ mod tests {
             let mut state = state_with_dsn("postgres://localhost/new");
             let run_id = state.session.begin_metadata_refresh();
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::MetadataLoaded {
                     dsn: "postgres://localhost/old".to_string(),
@@ -611,7 +127,7 @@ mod tests {
             let current_generation = state.session.selection_generation();
             let _ = state.session.begin_table_detail_run();
 
-            reduce_metadata(
+            dispatch_metadata(
                 &mut state,
                 &Action::TableDetailLoaded {
                     dsn: "postgres://localhost/test".to_string(),
@@ -635,7 +151,7 @@ mod tests {
                 .prefetch_queue
                 .push_back("public.users".to_string());
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::ProcessPrefetchQueue { run_id: old_run_id },
                 Instant::now(),
@@ -649,6 +165,7 @@ mod tests {
     }
 
     mod prefetch_table_detail {
+        use super::prefetch::MAX_PREFETCH_RETRIES;
         use super::*;
         use crate::model::er_state::ErStatus;
 
@@ -667,7 +184,7 @@ mod tests {
                 },
             );
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::PrefetchTableDetail {
                     run_id,
@@ -689,6 +206,69 @@ mod tests {
         }
 
         #[test]
+        fn backoff_uses_injected_now() {
+            let mut state = state_with_dsn("postgres://localhost/test");
+            let run_id = state.sql_modal.begin_prefetch();
+            let qualified = "public.users".to_string();
+            let failed_at = Instant::now();
+            let now = failed_at.checked_add(Duration::from_secs(1)).unwrap();
+            state.sql_modal.failed_prefetch_tables.insert(
+                qualified,
+                FailedPrefetchEntry {
+                    failed_at,
+                    error: "timeout".to_string(),
+                    retry_count: 1,
+                },
+            );
+
+            let effects = dispatch_metadata(
+                &mut state,
+                &Action::PrefetchTableDetail {
+                    run_id,
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                },
+                now,
+            )
+            .unwrap();
+
+            assert!(
+                effects.iter().any(|e| matches!(
+                    e,
+                    Effect::DelayedProcessPrefetchQueue { delay_secs: 1, .. }
+                ))
+            );
+        }
+
+        #[test]
+        fn no_dsn_requeues_without_marking_in_flight() {
+            let mut state = AppState::new("test".to_string());
+            let run_id = state.sql_modal.begin_prefetch();
+            let qualified = "public.users".to_string();
+            state
+                .er_preparation
+                .pending_tables
+                .insert(qualified.clone());
+
+            let effects = dispatch_metadata(
+                &mut state,
+                &Action::PrefetchTableDetail {
+                    run_id,
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+            assert!(effects.is_empty());
+            assert_eq!(state.sql_modal.prefetch_queue.front(), Some(&qualified));
+            assert!(!state.sql_modal.prefetching_tables.contains(&qualified));
+            assert!(!state.er_preparation.fetching_tables.contains(&qualified));
+            assert!(state.er_preparation.pending_tables.contains(&qualified));
+        }
+
+        #[test]
         fn retry_limit_exceeded_gives_up_and_calls_on_table_failed() {
             let mut state = state_with_dsn("postgres://localhost/test");
             let run_id = state.sql_modal.begin_prefetch();
@@ -706,7 +286,7 @@ mod tests {
                 },
             );
 
-            reduce_metadata(
+            dispatch_metadata(
                 &mut state,
                 &Action::PrefetchTableDetail {
                     run_id,
@@ -742,7 +322,7 @@ mod tests {
                 },
             );
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::PrefetchTableDetail {
                     run_id,
@@ -785,7 +365,7 @@ mod tests {
                 },
             );
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::PrefetchTableDetail {
                     run_id,
@@ -819,7 +399,7 @@ mod tests {
                 },
             );
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::PrefetchTableDetail {
                     run_id,
@@ -842,6 +422,7 @@ mod tests {
 
     mod table_detail_cache_failed {
         use super::*;
+        use crate::model::er_state::ErStatus;
         use crate::ports::outbound::DbOperationError;
 
         #[test]
@@ -860,7 +441,7 @@ mod tests {
             );
 
             let now = Instant::now();
-            reduce_metadata(
+            dispatch_metadata(
                 &mut state,
                 &Action::TableDetailCacheFailed {
                     dsn: "postgres://localhost/test".to_string(),
@@ -892,7 +473,7 @@ mod tests {
             state.sql_modal.prefetching_tables.insert(qualified.clone());
 
             let now = Instant::now();
-            reduce_metadata(
+            dispatch_metadata(
                 &mut state,
                 &Action::TableDetailCacheFailed {
                     dsn: "postgres://localhost/test".to_string(),
@@ -911,21 +492,153 @@ mod tests {
                 .unwrap();
             assert_eq!(entry.retry_count, 1);
         }
+
+        #[test]
+        fn failure_requeues_table_for_retry_with_delayed_process() {
+            let mut state = state_with_dsn("postgres://localhost/test");
+            let run_id = state.sql_modal.begin_prefetch();
+            let qualified = "public.users".to_string();
+            state.sql_modal.prefetching_tables.insert(qualified.clone());
+            state
+                .er_preparation
+                .fetching_tables
+                .insert(qualified.clone());
+
+            let effects = dispatch_metadata(
+                &mut state,
+                &Action::TableDetailCacheFailed {
+                    dsn: "postgres://localhost/test".to_string(),
+                    run_id,
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                    error: DbOperationError::Timeout("timed out".to_string()),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+            assert_eq!(state.sql_modal.prefetch_queue.back(), Some(&qualified));
+            assert!(state.er_preparation.pending_tables.contains(&qualified));
+            assert!(!state.er_preparation.fetching_tables.contains(&qualified));
+            assert!(!state.er_preparation.failed_tables.contains_key(&qualified));
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::DelayedProcessPrefetchQueue { .. }))
+            );
+            assert!(
+                effects
+                    .iter()
+                    .all(|e| !matches!(e, Effect::ProcessPrefetchQueue { .. }))
+            );
+        }
+
+        #[test]
+        fn failure_continues_existing_queue_before_retry_delay() {
+            let mut state = state_with_dsn("postgres://localhost/test");
+            let run_id = state.sql_modal.begin_prefetch();
+            let failed = "public.users".to_string();
+            let queued = "public.posts".to_string();
+            state.sql_modal.prefetching_tables.insert(failed.clone());
+            state.sql_modal.prefetch_queue.push_back(queued);
+            state.er_preparation.fetching_tables.insert(failed);
+
+            let effects = dispatch_metadata(
+                &mut state,
+                &Action::TableDetailCacheFailed {
+                    dsn: "postgres://localhost/test".to_string(),
+                    run_id,
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                    error: DbOperationError::Timeout("timed out".to_string()),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProcessPrefetchQueue { .. }))
+            );
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::DelayedProcessPrefetchQueue { .. }))
+            );
+        }
+
+        #[test]
+        fn transient_failure_then_success_clears_er_failure_state() {
+            let mut state = state_with_dsn("postgres://localhost/test");
+            let run_id = state.sql_modal.begin_prefetch();
+            state.er_preparation.status = ErStatus::Waiting;
+            state.er_preparation.fk_expanded = true;
+            let qualified = "public.users".to_string();
+            state.sql_modal.prefetching_tables.insert(qualified.clone());
+            state
+                .er_preparation
+                .fetching_tables
+                .insert(qualified.clone());
+
+            dispatch_metadata(
+                &mut state,
+                &Action::TableDetailCacheFailed {
+                    dsn: "postgres://localhost/test".to_string(),
+                    run_id,
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                    error: DbOperationError::Timeout("timed out".to_string()),
+                },
+                Instant::now(),
+            );
+            state.sql_modal.prefetch_queue.clear();
+            state.er_preparation.pending_tables.remove(&qualified);
+            state
+                .er_preparation
+                .fetching_tables
+                .insert(qualified.clone());
+
+            let effects = dispatch_metadata(
+                &mut state,
+                &Action::TableDetailCached {
+                    dsn: "postgres://localhost/test".to_string(),
+                    run_id,
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                    detail: empty_table("public", "users"),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+            assert!(state.er_preparation.failed_tables.is_empty());
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, Effect::WriteErFailureLog { .. }))
+            );
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::DispatchActions(actions)
+                    if actions.iter().any(|action| matches!(action, Action::ErGenerateFromCache))
+            )));
+        }
     }
 
     mod backoff_calculation {
-        use super::*;
+        use super::prefetch::backoff_secs_for;
 
         #[test]
         fn backoff_values() {
             // retry_count 0 → 1s
-            assert_eq!((BASE_BACKOFF_SECS * 2u64.pow(0)).min(MAX_BACKOFF_SECS), 1);
+            assert_eq!(backoff_secs_for(0), 1);
             // retry_count 1 → 2s
-            assert_eq!((BASE_BACKOFF_SECS * 2u64.pow(1)).min(MAX_BACKOFF_SECS), 2);
+            assert_eq!(backoff_secs_for(1), 2);
             // retry_count 2 → 4s
-            assert_eq!((BASE_BACKOFF_SECS * 2u64.pow(2)).min(MAX_BACKOFF_SECS), 4);
+            assert_eq!(backoff_secs_for(2), 4);
             // retry_count 3 → 4s (capped)
-            assert_eq!((BASE_BACKOFF_SECS * 2u64.pow(3)).min(MAX_BACKOFF_SECS), 4);
+            assert_eq!(backoff_secs_for(3), 4);
         }
     }
 
@@ -965,7 +678,7 @@ mod tests {
 
             let metadata = make_metadata(vec![("public", "orders")]);
             let action = metadata_loaded_action(&mut state, metadata);
-            reduce_metadata(&mut state, &action, Instant::now());
+            dispatch_metadata(&mut state, &action, Instant::now());
 
             assert!(state.query.pagination.table.is_empty());
             assert!(state.query.current_result().is_none());
@@ -983,7 +696,7 @@ mod tests {
             // "orders" comes before "users" alphabetically, so "users" → index 1
             let metadata = make_metadata(vec![("public", "orders"), ("public", "users")]);
             let action = metadata_loaded_action(&mut state, metadata);
-            let effects = reduce_metadata(&mut state, &action, Instant::now()).unwrap();
+            let effects = dispatch_metadata(&mut state, &action, Instant::now()).unwrap();
 
             assert_eq!(state.query.pagination.table, "users");
             assert_eq!(state.ui.explorer_selected, 1);
@@ -1005,7 +718,7 @@ mod tests {
 
             let metadata = make_metadata(vec![("public", "orders"), ("public", "users")]);
             let action = metadata_loaded_action(&mut state, metadata);
-            reduce_metadata(&mut state, &action, Instant::now());
+            dispatch_metadata(&mut state, &action, Instant::now());
 
             assert_eq!(state.ui.explorer_selected, 0);
         }
@@ -1019,7 +732,7 @@ mod tests {
             // New DB happens to have a table named "users" too
             let metadata = make_metadata(vec![("public", "users")]);
             let action = metadata_loaded_action(&mut state, metadata);
-            let effects = reduce_metadata(&mut state, &action, Instant::now()).unwrap();
+            let effects = dispatch_metadata(&mut state, &action, Instant::now()).unwrap();
 
             // No table was selected on this connection, so no auto-preview should fire
             assert!(
@@ -1056,7 +769,7 @@ mod tests {
             let mut state = state_with_dsn("postgres://localhost/test");
             state.session.set_metadata(Some(make_metadata(530)));
 
-            let effects = reduce_metadata(&mut state, &Action::StartPrefetchAll, Instant::now())
+            let effects = dispatch_metadata(&mut state, &Action::StartPrefetchAll, Instant::now())
                 .into_effects()
                 .expect("reducer should handle action");
 
@@ -1072,7 +785,7 @@ mod tests {
             let mut state = state_with_dsn("postgres://localhost/test");
             state.session.set_metadata(Some(make_metadata(50)));
 
-            let effects = reduce_metadata(&mut state, &Action::StartPrefetchAll, Instant::now())
+            let effects = dispatch_metadata(&mut state, &Action::StartPrefetchAll, Instant::now())
                 .into_effects()
                 .expect("reducer should handle action");
 
@@ -1088,7 +801,7 @@ mod tests {
             let mut state = state_with_dsn("postgres://localhost/test");
             state.session.set_metadata(Some(make_metadata(10)));
 
-            reduce_metadata(&mut state, &Action::StartPrefetchAll, Instant::now());
+            dispatch_metadata(&mut state, &Action::StartPrefetchAll, Instant::now());
 
             assert!(state.er_preparation.fk_expanded);
         }
@@ -1106,7 +819,7 @@ mod tests {
                 .pending_tables
                 .insert("public.users".to_string());
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::StartPrefetchScoped {
                     tables: vec!["public.posts".to_string()],
@@ -1125,7 +838,7 @@ mod tests {
             let mut state = state_with_dsn("postgres://localhost/test");
             let tables = vec!["public.users".to_string(), "public.orders".to_string()];
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::StartPrefetchScoped {
                     tables: tables.clone(),
@@ -1189,15 +902,17 @@ mod tests {
     }
 
     mod fk_neighbors_discovered {
+        use super::prefetch::MAX_PREFETCH_RETRIES;
         use super::*;
         use crate::model::er_state::ErStatus;
 
         #[test]
         fn empty_neighbors_dispatches_generate() {
             let mut state = state_with_dsn("postgres://localhost/test");
+            let _ = state.sql_modal.begin_prefetch();
             state.er_preparation.status = ErStatus::Waiting;
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::FkNeighborsDiscovered { tables: vec![] },
                 Instant::now(),
@@ -1218,7 +933,7 @@ mod tests {
             let _ = state.sql_modal.begin_prefetch();
             state.er_preparation.status = ErStatus::Waiting;
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::FkNeighborsDiscovered {
                     tables: vec!["public.posts".to_string(), "public.tags".to_string()],
@@ -1235,6 +950,80 @@ mod tests {
                 effects
                     .iter()
                     .any(|e| matches!(e, Effect::ProcessPrefetchQueue { .. }))
+            );
+        }
+
+        #[test]
+        fn stale_neighbors_without_active_run_do_not_mutate_state() {
+            let mut state = state_with_dsn("postgres://localhost/test");
+            state.er_preparation.status = ErStatus::Waiting;
+
+            let effects = dispatch_metadata(
+                &mut state,
+                &Action::FkNeighborsDiscovered {
+                    tables: vec!["public.posts".to_string()],
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+            assert!(!state.er_preparation.fk_expanded);
+            assert!(state.er_preparation.pending_tables.is_empty());
+            assert!(state.sql_modal.prefetch_queue.is_empty());
+            assert!(effects.is_empty());
+        }
+
+        #[test]
+        fn duplicate_neighbors_are_not_requeued() {
+            let mut state = state_with_dsn("postgres://localhost/test");
+            let _ = state.sql_modal.begin_prefetch();
+            state.er_preparation.status = ErStatus::Waiting;
+            state
+                .er_preparation
+                .pending_tables
+                .insert("public.posts".to_string());
+            state
+                .sql_modal
+                .prefetch_queue
+                .push_back("public.posts".to_string());
+            state
+                .sql_modal
+                .prefetching_tables
+                .insert("public.tags".to_string());
+
+            dispatch_metadata(
+                &mut state,
+                &Action::FkNeighborsDiscovered {
+                    tables: vec![
+                        "public.posts".to_string(),
+                        "public.tags".to_string(),
+                        "public.comments".to_string(),
+                    ],
+                },
+                Instant::now(),
+            );
+
+            assert_eq!(state.sql_modal.prefetch_queue.len(), 2);
+            assert_eq!(
+                state
+                    .sql_modal
+                    .prefetch_queue
+                    .iter()
+                    .filter(|table| table.as_str() == "public.posts")
+                    .count(),
+                1
+            );
+            assert!(
+                state
+                    .sql_modal
+                    .prefetch_queue
+                    .contains(&"public.comments".to_string())
+            );
+            assert!(
+                !state
+                    .sql_modal
+                    .prefetch_queue
+                    .contains(&"public.tags".to_string())
             );
         }
 
@@ -1256,7 +1045,7 @@ mod tests {
                 },
             );
 
-            let effects = reduce_metadata(
+            let effects = dispatch_metadata(
                 &mut state,
                 &Action::PrefetchTableDetail {
                     run_id,

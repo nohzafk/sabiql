@@ -44,7 +44,44 @@ impl ErPreparationState {
 
     pub fn on_table_failed(&mut self, qualified_name: &str, error: String) {
         self.fetching_tables.remove(qualified_name);
+        self.pending_tables.remove(qualified_name);
         self.failed_tables.insert(qualified_name.to_string(), error);
+    }
+
+    pub fn start_fetching(&mut self, qualified_name: &str) {
+        self.pending_tables.remove(qualified_name);
+        self.fetching_tables.insert(qualified_name.to_string());
+    }
+
+    pub fn requeue_for_retry(&mut self, qualified_name: &str) {
+        self.fetching_tables.remove(qualified_name);
+        self.pending_tables.insert(qualified_name.to_string());
+    }
+
+    pub fn begin_all_prefetch<I>(&mut self, tables: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.pending_tables.clear();
+        self.fetching_tables.clear();
+        self.failed_tables.clear();
+        self.total_tables = 0;
+        self.fk_expanded = true;
+
+        for table in tables {
+            self.pending_tables.insert(table);
+            self.total_tables += 1;
+        }
+    }
+
+    pub fn begin_scoped_prefetch(&mut self, tables: &[String]) {
+        self.pending_tables.clear();
+        self.fetching_tables.clear();
+        self.failed_tables.clear();
+        self.fk_expanded = false;
+        self.seed_tables = tables.to_vec();
+        self.total_tables = tables.len();
+        self.pending_tables.extend(tables.iter().cloned());
     }
 
     pub fn retry_failed(&mut self) {
@@ -167,6 +204,91 @@ mod tests {
 
             assert!(!state.fetching_tables.contains("public.users"));
             assert!(state.failed_tables.contains_key("public.users"));
+        }
+
+        #[test]
+        fn removes_from_pending() {
+            let mut state = ErPreparationState::default();
+            state.pending_tables.insert("public.users".to_string());
+
+            state.on_table_failed("public.users", "timeout".to_string());
+
+            assert!(!state.pending_tables.contains("public.users"));
+        }
+    }
+
+    mod requeue_for_retry {
+        use super::*;
+
+        #[test]
+        fn moves_from_fetching_to_pending_without_failed_state() {
+            let mut state = ErPreparationState::default();
+            state.fetching_tables.insert("public.users".to_string());
+
+            state.requeue_for_retry("public.users");
+
+            assert!(!state.fetching_tables.contains("public.users"));
+            assert!(state.pending_tables.contains("public.users"));
+            assert!(!state.failed_tables.contains_key("public.users"));
+        }
+    }
+
+    mod start_fetching {
+        use super::*;
+
+        #[test]
+        fn moves_from_pending_to_fetching() {
+            let mut state = ErPreparationState::default();
+            state.pending_tables.insert("public.users".to_string());
+
+            state.start_fetching("public.users");
+
+            assert!(!state.pending_tables.contains("public.users"));
+            assert!(state.fetching_tables.contains("public.users"));
+        }
+    }
+
+    mod begin_prefetch {
+        use super::*;
+
+        #[test]
+        fn all_prefetch_replaces_progress_and_marks_fk_expanded() {
+            let mut state = ErPreparationState {
+                pending_tables: HashSet::from(["stale.pending".to_string()]),
+                fetching_tables: HashSet::from(["stale.fetching".to_string()]),
+                failed_tables: HashMap::from([("stale.failed".to_string(), "error".to_string())]),
+                fk_expanded: false,
+                ..Default::default()
+            };
+
+            state.begin_all_prefetch(vec![
+                "public.users".to_string(),
+                "public.orders".to_string(),
+            ]);
+
+            assert_eq!(state.total_tables, 2);
+            assert!(state.fk_expanded);
+            assert!(state.fetching_tables.is_empty());
+            assert!(state.failed_tables.is_empty());
+            assert!(state.pending_tables.contains("public.users"));
+            assert!(state.pending_tables.contains("public.orders"));
+        }
+
+        #[test]
+        fn scoped_prefetch_records_seed_tables_and_pending_set() {
+            let mut state = ErPreparationState {
+                fk_expanded: true,
+                ..Default::default()
+            };
+            let tables = vec!["public.users".to_string(), "public.orders".to_string()];
+
+            state.begin_scoped_prefetch(&tables);
+
+            assert_eq!(state.total_tables, 2);
+            assert!(!state.fk_expanded);
+            assert_eq!(state.seed_tables, tables);
+            assert!(state.pending_tables.contains("public.users"));
+            assert!(state.pending_tables.contains("public.orders"));
         }
     }
 
